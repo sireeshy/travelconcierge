@@ -1,16 +1,21 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import google.genai as genai
 from google.genai import types
 import requests
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 from dateutil import parser
-import json
+from timezonefinder import TimezoneFinder
+from zoneinfo import ZoneInfo
+import base64
 import os
 import re
 import dotenv
 
 dotenv.load_dotenv()
+
+_timezone_finder = TimezoneFinder()
 
 # --- Helper Function for Google Maps Autocomplete ---
 
@@ -39,6 +44,30 @@ def get_place_predictions(query_text: str, api_key: str) -> list[str]:
     except Exception:
         pass
     return [query_text]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_timezone_for_location(location: str, api_key: str) -> str:
+    """Resolves a place name to its IANA timezone (e.g. 'Asia/Kolkata') by geocoding it and
+    then looking up the timezone offline for those coordinates -- no separate Time Zone API
+    call or extra enablement needed. Falls back to Asia/Kolkata (this app's home turf) if the
+    location can't be geocoded."""
+    if location and api_key:
+        try:
+            response = requests.get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params={"address": location, "key": api_key},
+                timeout=5,
+            )
+            results = response.json().get('results', [])
+            if results:
+                loc = results[0]['geometry']['location']
+                tz_name = _timezone_finder.timezone_at(lat=loc['lat'], lng=loc['lng'])
+                if tz_name:
+                    return tz_name
+        except Exception:
+            pass
+    return "Asia/Kolkata"
 
 # --- Pydantic Models for Tool Outputs ---
 
@@ -240,6 +269,44 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     return {"details": results}
 
 
+def render_copy_and_share(text: str):
+    """Renders a Copy button and a Share-on-WhatsApp button for a block of text.
+
+    WhatsApp's pre-filled share links (wa.me / api.whatsapp.com) can silently fail or get
+    truncated for long text, so the share button also copies the full text to the clipboard
+    as a guaranteed fallback the user can paste in if the pre-fill doesn't come through.
+    """
+    b64 = base64.b64encode(text.encode('utf-8')).decode('ascii')
+    # st.markdown(unsafe_allow_html=True) sanitizes out inline event handlers (onclick etc.),
+    # so this needs an actual iframe via components.html instead, which allows real JS.
+    components.html(
+        f"""
+        <div style="display:flex; gap:8px; font-family:sans-serif;">
+          <button onclick="
+            (function(btn){{
+              const bytes = Uint8Array.from(atob('{b64}'), c => c.charCodeAt(0));
+              const decoded = new TextDecoder('utf-8').decode(bytes);
+              navigator.clipboard.writeText(decoded).then(() => {{
+                const orig = btn.innerText;
+                btn.innerText = '✅ Copied!';
+                setTimeout(() => {{ btn.innerText = orig; }}, 1500);
+              }});
+            }})(this)
+          " style="padding:6px 14px; border-radius:6px; border:1px solid #999; background:#f0f2f6; color:#31333F; cursor:pointer; font-size:14px;">📋 Copy</button>
+          <button onclick="
+            (function(btn){{
+              const bytes = Uint8Array.from(atob('{b64}'), c => c.charCodeAt(0));
+              const decoded = new TextDecoder('utf-8').decode(bytes);
+              navigator.clipboard.writeText(decoded);
+              window.open('https://api.whatsapp.com/send?text=' + encodeURIComponent(decoded), '_blank');
+            }})(this)
+          " style="padding:6px 14px; border-radius:6px; border:1px solid #25D366; background:#25D366; color:white; cursor:pointer; font-size:14px;">📤 Share on WhatsApp</button>
+        </div>
+        """,
+        height=45,
+    )
+
+
 # --- Streamlit UI ---
 st.set_page_config(page_title="🛣️ Highway Pitstop Concierge", layout="wide")
 
@@ -289,22 +356,24 @@ with col2:
         dest_options = [dest_search]
     destination = st.selectbox("🎯 Confirmed Destination (Google Maps)", options=dest_options)
 
-IST = timezone(timedelta(hours=5, minutes=30))
-now_ist = datetime.now(IST)
+origin_tz_name = get_timezone_for_location(origin, st.session_state.get("google_maps_api_key", ""))
+origin_tz = ZoneInfo(origin_tz_name)
+now_local = datetime.now(origin_tz)
+st.caption(f"🕐 Times below are local time at your origin ({origin_tz_name.replace('_', ' ')}).")
 
 st.markdown("**Departure Date**")
 date_col1, date_col2, date_col3 = st.columns(3)
 with date_col1:
     if st.button("Today", use_container_width=True):
-        st.session_state.departure_date = now_ist.date()
+        st.session_state.departure_date = now_local.date()
 with date_col2:
     if st.button("Tomorrow", use_container_width=True):
-        st.session_state.departure_date = now_ist.date() + timedelta(days=1)
+        st.session_state.departure_date = now_local.date() + timedelta(days=1)
 with date_col3:
     if st.button("Day after", use_container_width=True):
-        st.session_state.departure_date = now_ist.date() + timedelta(days=2)
+        st.session_state.departure_date = now_local.date() + timedelta(days=2)
 departure_date = st.date_input(
-    "Departure date", key="departure_date", value=now_ist.date(), label_visibility="collapsed"
+    "Departure date", key="departure_date", value=now_local.date(), label_visibility="collapsed"
 )
 
 def _format_time_12h(t):
@@ -314,14 +383,14 @@ st.markdown("**Departure Time**")
 time_col1, time_col2, time_col3 = st.columns(3)
 with time_col1:
     if st.button("Now", use_container_width=True):
-        st.session_state.departure_time_text = _format_time_12h(now_ist)
+        st.session_state.departure_time_text = _format_time_12h(now_local)
 with time_col2:
     if st.button("1 hr from now", use_container_width=True):
-        st.session_state.departure_time_text = _format_time_12h(now_ist + timedelta(hours=1))
+        st.session_state.departure_time_text = _format_time_12h(now_local + timedelta(hours=1))
 with time_col3:
     st.button("Custom", use_container_width=True, disabled=True, help="Type any time below, e.g. '630pm' or '6:30 PM'")
 departure_time_str = st.text_input(
-    "Departure time", key="departure_time_text", value=_format_time_12h(now_ist),
+    "Departure time", key="departure_time_text", value=_format_time_12h(now_local),
     label_visibility="collapsed"
 )
 
@@ -338,12 +407,12 @@ preferences = st.text_area(
 
 try:
     departure_time_val = parser.parse(departure_time_str).time()
-    departure_datetime = datetime.combine(departure_date, departure_time_val, tzinfo=IST)
+    departure_datetime = datetime.combine(departure_date, departure_time_val, tzinfo=origin_tz)
     # The "Now" default is only fresh at page load -- if the page has been open a while and the
     # picked date/time has quietly drifted into the past, treat it as "as soon as possible" instead
     # of sending an invalid past timestamp to the Routes API.
-    if departure_datetime < now_ist:
-        departure_datetime = now_ist + timedelta(minutes=1)
+    if departure_datetime < now_local:
+        departure_datetime = now_local + timedelta(minutes=1)
         st.caption(f"⏱️ That time has passed — using {_format_time_12h(departure_datetime.time())} instead.")
     departure_time_iso = departure_datetime.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 except Exception as e:
@@ -446,6 +515,8 @@ if st.session_state.get('planning_triggered', False):
     for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message["role"] == "assistant":
+                render_copy_and_share(message["content"])
 
     followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
     if followup:
