@@ -3,7 +3,7 @@ import google.genai as genai
 from google.genai import types
 import requests
 from pydantic import BaseModel, Field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dateutil import parser
 import json
 import os
@@ -288,17 +288,22 @@ preferences = st.text_area(
     "Traveling with elderly parents, need pure veg and clean restrooms"
 )
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
 try:
     if 'T' in departure_time_str or '-' in departure_time_str:
         departure_datetime = parser.parse(departure_time_str)
+        if departure_datetime.tzinfo is None:
+            departure_datetime = departure_datetime.replace(tzinfo=IST)
     else:
-        today = datetime.now().date()
+        # A bare time like "11:30 AM" means the next upcoming occurrence in IST,
+        # since this app plans road trips within India.
         time_obj = parser.parse(departure_time_str).time()
-        departure_datetime = datetime.combine(today, time_obj)
-    if departure_datetime.tzinfo is not None:
-        departure_time_iso = departure_datetime.isoformat(timespec='seconds')
-    else:
-        departure_time_iso = departure_datetime.isoformat(timespec='seconds') + 'Z'
+        now_ist = datetime.now(IST)
+        departure_datetime = datetime.combine(now_ist.date(), time_obj, tzinfo=IST)
+        if departure_datetime <= now_ist:
+            departure_datetime += timedelta(days=1)
+    departure_time_iso = departure_datetime.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 except Exception as e:
     st.error(f"Invalid Departure Time format: {e}")
     departure_time_iso = None
