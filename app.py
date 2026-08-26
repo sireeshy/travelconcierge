@@ -73,7 +73,7 @@ def get_timezone_for_location(location: str, api_key: str) -> str:
 def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: str) -> dict:
     """
     Calculates the route between an origin and destination, providing total duration, distance,
-    and estimated arrival times (ETAs) for major milestones along the route, considering traffic.
+    estimated toll cost, and estimated arrival times (ETAs) for major milestones, considering traffic.
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
@@ -83,7 +83,7 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.polyline.encodedPolyline"
+        "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.polyline.encodedPolyline,routes.travelAdvisory.tollInfo"
     }
     data = {
         "origin": {"address": origin},
@@ -93,7 +93,9 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
         "routingPreference": "TRAFFIC_AWARE",
         "computeAlternativeRoutes": False,
         "languageCode": "en-US",
-        "units": "METRIC"
+        "units": "METRIC",
+        "extraComputations": ["TOLLS"],
+        "routeModifiers": {"vehicleInfo": {"emissionType": "GASOLINE"}}
     }
 
     response = requests.post(url, headers=headers, json=data)
@@ -115,11 +117,18 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
             "encoded_polyline": leg_data['polyline']['encodedPolyline']
         })
 
+    toll_prices = route.get('travelAdvisory', {}).get('tollInfo', {}).get('estimatedPrice', [])
+    estimated_toll = None
+    if toll_prices:
+        price = toll_prices[0]
+        estimated_toll = f"{price.get('units', '0')}.{price.get('nanos', 0) // 10_000_000:02d} {price.get('currencyCode', '')}".strip()
+
     return {
         "total_duration_seconds": int(route['duration'].replace('s', '')),
         "total_distance_meters": route['distanceMeters'],
         "legs": legs,
-        "encoded_overall_polyline": route['polyline']['encodedPolyline']
+        "encoded_overall_polyline": route['polyline']['encodedPolyline'],
+        "estimated_toll_cost": estimated_toll
     }
 
 
@@ -182,7 +191,7 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "id,displayName.text,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,currentOpeningHours,priceLevel,regularOpeningHours,reviews,servesBreakfast,servesLunch,servesDinner,servesVegetarianFood"
+        "X-Goog-FieldMask": "id,displayName.text,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,currentOpeningHours,priceLevel,regularOpeningHours,reviews,servesBreakfast,servesLunch,servesDinner,servesVegetarianFood,parkingOptions"
     }
 
     results = []
@@ -203,6 +212,19 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
                 "text": review_text[:280]
             })
 
+        parking_options = details_data.get('parkingOptions', {})
+        available_parking = [
+            label for flag, label in [
+                ('freeParkingLot', 'free parking lot'),
+                ('paidParkingLot', 'paid parking lot'),
+                ('freeStreetParking', 'free street parking'),
+                ('paidStreetParking', 'paid street parking'),
+                ('valetParking', 'valet parking'),
+                ('freeGarageParking', 'free garage parking'),
+                ('paidGarageParking', 'paid garage parking'),
+            ] if parking_options.get(flag)
+        ]
+
         results.append({
             "place_id": place_id,
             "opening_hours": details_data.get('regularOpeningHours'),
@@ -216,7 +238,8 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
             "serves_breakfast": details_data.get('servesBreakfast'),
             "serves_lunch": details_data.get('servesLunch'),
             "serves_dinner": details_data.get('servesDinner'),
-            "serves_vegetarian_food": details_data.get('servesVegetarianFood')
+            "serves_vegetarian_food": details_data.get('servesVegetarianFood'),
+            "parking_available": available_parking if available_parking else "Not listed by Google -- mention this is unverified if parking matters for this trip"
         })
 
     return {"details": results}
@@ -353,10 +376,32 @@ if _compact_time_match:
     hour, minute, meridiem = _compact_time_match.groups()
     departure_time_str = f"{hour}:{minute} {meridiem}"
 
-preferences = st.text_area(
+st.markdown("**Quick Preferences** (optional — combined with the notes below)")
+qp_col1, qp_col2, qp_col3, qp_col4 = st.columns(4)
+with qp_col1:
+    want_veg = st.checkbox("🥗 Pure Veg")
+with qp_col2:
+    want_fuel = st.checkbox("⛽ Fuel Stop")
+with qp_col3:
+    want_restroom = st.checkbox("🚻 Restroom Break")
+with qp_col4:
+    want_snacks = st.checkbox("🍿 Snacks/Drinks")
+
+preferences_notes = st.text_area(
     "Preferences / Notes",
     "Traveling with elderly parents, need pure veg and clean restrooms"
 )
+
+_quick_prefs = []
+if want_veg:
+    _quick_prefs.append("Pure vegetarian food only.")
+if want_fuel:
+    _quick_prefs.append("Need a fuel/petrol stop along the way.")
+if want_restroom:
+    _quick_prefs.append("Need a restroom break stop.")
+if want_snacks:
+    _quick_prefs.append("Need to pick up snacks and drinks.")
+preferences = (" ".join(_quick_prefs) + " " + preferences_notes).strip() if _quick_prefs else preferences_notes
 
 try:
     departure_time_val = parser.parse(departure_time_str).time()
@@ -400,7 +445,8 @@ if st.session_state.get('planning_triggered', False):
     gemini_tools = [
         calculate_route_and_etas,
         search_places_along_route,
-        get_place_details_and_reviews
+        get_place_details_and_reviews,
+        types.Tool(google_search=types.GoogleSearch())
     ]
 
     system_instruction = (
@@ -419,21 +465,33 @@ if st.session_state.get('planning_triggered', False):
         "Always try to find multiple suitable options, but call search_places_along_route at most once per kind of stop needed. "
         "Call get_place_details_and_reviews exactly once, passing the place_ids of every candidate place "
         "you want details for together in one list, instead of calling it separately per place. "
-        "When outputting the final plan, include a summary itinerary timeline at the top with departure and stop arrival times. "
+        "When outputting the final plan, include a summary itinerary timeline at the top with departure and stop "
+        "arrival times, and mention the estimated toll cost for the route if calculate_route_and_etas returned one. "
         "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) for quick-scan ratings. Provide actual ratings and review snippets. "
         "The following Highway Parameter Rubric applies specifically when evaluating FOOD stops (skip it for "
         "non-food stops like shops, fuel, or pharmacies, and instead just note hours, ratings, and anything "
         "relevant from reviews): explicitly state if it's 'Pure Veg', 'Veg & Non-Veg', or 'Fast Food/Chains'; "
         "if traveling with elders, flag places with no traditional Indian meals (Roti/Dal/Thali) as ⚠️; "
-        "verify the kitchen is open and serving the appropriate meal (Breakfast/Lunch/Snacks/Dinner) at the calculated ETA."
+        "verify the kitchen is open and serving the appropriate meal (Breakfast/Lunch/Snacks/Dinner) at the calculated ETA. "
+        "For every recommended stop, mention parking availability using the 'parking_available' field from "
+        "get_place_details_and_reviews. "
+        "If the total drive duration from calculate_route_and_etas exceeds 2 hours, proactively search for and "
+        "recommend a clean public restroom option along the route even if the user didn't explicitly ask for one, "
+        "and note restroom availability/cleanliness for long trips even when the main stop is a non-restaurant errand. "
+        "If a promising place has very few reviews (roughly under 10) and you're unsure it's reliable -- e.g. it "
+        "might be new or low-quality -- use the google_search tool to check for other information about it (news, "
+        "blog mentions, its own website) before recommending it, and say in the plan that you double-checked it "
+        "this way since Google reviews were sparse."
     )
 
     # Set up configuration with tools and system instruction
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         tools=gemini_tools,
+        # Required to mix our custom function-calling tools with the built-in Google Search tool.
+        tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
         automatic_function_calling=types.AutomaticFunctionCallingConfig(
-            maximum_remote_calls=12
+            maximum_remote_calls=15
         )
     )
 
