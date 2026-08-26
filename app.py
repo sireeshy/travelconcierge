@@ -141,9 +141,15 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     }
 
 
-def search_places_along_route(encoded_polyline: str, category: str = "restaurant") -> dict:
+def search_places_along_route(encoded_polyline: str, category: str) -> dict:
     """
-    Searches for places of a specific category along an encoded polyline route.
+    Searches for places along an encoded polyline route matching a free-text query.
+
+    'category' is a natural-language search query for whatever the user actually needs along the
+    route -- not limited to food. Pick a query that matches their request, e.g. "vegetarian
+    restaurant", "clean public restroom", "grocery store", "liquor store", "convenience store
+    selling snacks and drinks", "petrol pump", "pharmacy", "ATM". Call this once per distinct kind
+    of stop the user needs.
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
@@ -333,6 +339,12 @@ preferences = st.text_area(
 try:
     departure_time_val = parser.parse(departure_time_str).time()
     departure_datetime = datetime.combine(departure_date, departure_time_val, tzinfo=IST)
+    # The "Now" default is only fresh at page load -- if the page has been open a while and the
+    # picked date/time has quietly drifted into the past, treat it as "as soon as possible" instead
+    # of sending an invalid past timestamp to the Routes API.
+    if departure_datetime < now_ist:
+        departure_datetime = now_ist + timedelta(minutes=1)
+        st.caption(f"⏱️ That time has passed — using {_format_time_12h(departure_datetime.time())} instead.")
     departure_time_iso = departure_datetime.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 except Exception as e:
     st.error(f"Invalid time format: {e}")
@@ -371,22 +383,27 @@ if st.session_state.get('planning_triggered', False):
 
     system_instruction = (
         "You are a Thoughtful Indian Highway Concierge. Your goal is to plan an optimal road trip "
-        "for the user, focusing on comfortable and safe pitstops for food and restrooms. "
-        "Prioritize clean restrooms and appropriate food options based on user preferences. "
-        "Evaluate each place against the Highway Parameter Rubric. Provide structured, scannable Markdown output. "
+        "for the user and help with whatever stops they actually need along the way — this can include "
+        "food, restrooms, fuel, pharmacies, ATMs, or errands like picking up snacks, drinks, or groceries. "
+        "Read the user's request carefully and search for the specific kind of place that matches it "
+        "(e.g. a request for snacks and drinks means a grocery/convenience/liquor store, not a restaurant). "
+        "Do not default to restaurants unless the user is actually asking about a meal. "
+        "Provide structured, scannable Markdown output. "
         "Be extremely helpful and empathetic. Speak in a friendly, conversational tone, like a knowledgeable local guide. "
         "Do not make up information. Only use the tools provided to gather information. "
         "If a tool call returns an error, do not retry it with guessed or reformatted inputs and do not invent "
         "place IDs or details — report the limitation to the user instead. "
         "When calculating ETAs, consider the 'departure_time_iso' for traffic. "
-        "Always try to find multiple suitable stops, but call search_places_along_route at most once per category. "
+        "Always try to find multiple suitable options, but call search_places_along_route at most once per kind of stop needed. "
         "Call get_place_details_and_reviews exactly once, passing the place_ids of every candidate place "
         "you want details for together in one list, instead of calling it separately per place. "
         "When outputting the final plan, include a summary itinerary timeline at the top with departure and stop arrival times. "
-        "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) for rubrics. Provide actual ratings and review snippets. "
-        "For food, explicitly state if it's 'Pure Veg', 'Veg & Non-Veg', or 'Fast Food/Chains'. "
-        "If traveling with elders, flag places with no traditional Indian meals (Roti/Dal/Thali) as ⚠️. "
-        "Verify if the kitchen is open and serving the appropriate meal (Breakfast/Lunch/Snacks/Dinner) at the calculated ETA for the stop."
+        "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) for quick-scan ratings. Provide actual ratings and review snippets. "
+        "The following Highway Parameter Rubric applies specifically when evaluating FOOD stops (skip it for "
+        "non-food stops like shops, fuel, or pharmacies, and instead just note hours, ratings, and anything "
+        "relevant from reviews): explicitly state if it's 'Pure Veg', 'Veg & Non-Veg', or 'Fast Food/Chains'; "
+        "if traveling with elders, flag places with no traditional Indian meals (Roti/Dal/Thali) as ⚠️; "
+        "verify the kitchen is open and serving the appropriate meal (Breakfast/Lunch/Snacks/Dinner) at the calculated ETA."
     )
 
     # Set up configuration with tools and system instruction
@@ -415,8 +432,11 @@ if st.session_state.get('planning_triggered', False):
             f"Plan a highway trip from {st.session_state.origin} to {st.session_state.destination}. "
             f"My departure time is {st.session_state.departure_time_iso}. "
             f"Here are my preferences/notes: {st.session_state.preferences}. "
-            "First, calculate the route and ETAs. Next, search for places along the route polyline. "
-            "Finally, fetch place details/reviews for the best options and evaluate them against the rubric."
+            "First, calculate the route and ETAs. Next, based on what I actually need (see my preferences/notes "
+            "above), search along the route polyline for the appropriate kind of stop -- this might be food, "
+            "restrooms, fuel, or an errand like buying snacks/drinks/groceries; don't assume it's a restaurant "
+            "unless my notes actually ask for one. Finally, fetch place details/reviews for the best options and "
+            "evaluate them appropriately for what I asked for."
         )
         with st.spinner("Planning your highway trip and evaluating live stops..."):
             response = chat.send_message(prompt)
