@@ -3,7 +3,6 @@ import streamlit.components.v1 as components
 import google.genai as genai
 from google.genai import types
 import requests
-from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 from dateutil import parser
 from timezonefinder import TimezoneFinder
@@ -68,52 +67,6 @@ def get_timezone_for_location(location: str, api_key: str) -> str:
         except Exception:
             pass
     return "Asia/Kolkata"
-
-# --- Pydantic Models for Tool Outputs ---
-
-class RouteLeg(BaseModel):
-    duration_seconds: int
-    distance_meters: int
-    end_address: str
-    start_address: str
-    encoded_polyline: str
-
-class RouteResponse(BaseModel):
-    total_duration_seconds: int
-    total_distance_meters: int
-    legs: list[RouteLeg]
-    encoded_overall_polyline: str
-
-class Place(BaseModel):
-    place_id: str
-    name: str
-    rating: float | None = None
-    user_ratings_total: int | None = None
-    vicinity: str
-    types: list[str]
-
-class SearchPlacesResponse(BaseModel):
-    places: list[Place]
-
-class Review(BaseModel):
-    author_name: str
-    rating: int
-    text: str | None = None
-
-class PlaceDetails(BaseModel):
-    place_id: str
-    opening_hours: dict | None = None
-    reviews: list[Review]
-    current_opening_status: str | None = None
-    price_level: str | None = None
-    serves_breakfast: bool | None = None
-    serves_lunch: bool | None = None
-    serves_dinner: bool | None = None
-    serves_vegetarian_food: bool | None = None
-    error: str | None = None
-
-class PlaceDetailsBatchResponse(BaseModel):
-    details: list[PlaceDetails]
 
 # --- Gemini Tool Definitions ---
 
