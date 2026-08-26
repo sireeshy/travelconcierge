@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser
 import json
 import os
+import re
 import dotenv
 
 dotenv.load_dotenv()
@@ -282,7 +283,13 @@ with col2:
         dest_options = [dest_search]
     destination = st.selectbox("🎯 Confirmed Destination (Google Maps)", options=dest_options)
 
-departure_time_str = st.text_input("Departure Time (e.g., '11:30 AM' or '2026-08-27T11:30:00Z')", "11:30 AM")
+departure_time_str = st.text_input("Departure Time (e.g., '11:30 AM', '630pm', or '2026-08-27T11:30:00Z')", "11:30 AM")
+
+# Accept compact times like "630pm" or "630 pm" by inserting the colon dateutil expects.
+_compact_time_match = re.fullmatch(r'(\d{1,2})(\d{2})\s*([AaPp][Mm])', departure_time_str.strip())
+if _compact_time_match:
+    hour, minute, meridiem = _compact_time_match.groups()
+    departure_time_str = f"{hour}:{minute} {meridiem}"
 preferences = st.text_area(
     "Preferences / Notes",
     "Traveling with elderly parents, need pure veg and clean restrooms"
@@ -319,6 +326,10 @@ if st.button("Plan My Trip", use_container_width=True):
         st.session_state.destination = destination
         st.session_state.departure_time_iso = departure_time_iso
         st.session_state.preferences = preferences
+        # Starting a new plan resets any prior conversation.
+        st.session_state.chat = None
+        st.session_state.chat_messages = []
+        st.session_state.need_new_plan = True
 
 if st.session_state.get('planning_triggered', False):
     if not st.session_state.get('gemini_api_key'):
@@ -364,13 +375,19 @@ if st.session_state.get('planning_triggered', False):
         )
     )
 
-    # Create chat session using the new SDK
-    chat = client.chats.create(
-        model='gemini-3.6-flash',
-        config=config
-    )
+    # Reuse the same chat session across reruns so follow-up questions share context.
+    if st.session_state.get('chat') is None:
+        st.session_state.chat = client.chats.create(
+            model='gemini-3.6-flash',
+            config=config
+        )
+    chat = st.session_state.chat
 
-    with st.spinner("Planning your highway trip and evaluating live stops..."):
+    if 'chat_messages' not in st.session_state:
+        st.session_state.chat_messages = []
+
+    if st.session_state.get('need_new_plan', False):
+        st.session_state.need_new_plan = False
         prompt = (
             f"Plan a highway trip from {st.session_state.origin} to {st.session_state.destination}. "
             f"My departure time is {st.session_state.departure_time_iso}. "
@@ -378,8 +395,19 @@ if st.session_state.get('planning_triggered', False):
             "First, calculate the route and ETAs. Next, search for places along the route polyline. "
             "Finally, fetch place details/reviews for the best options and evaluate them against the rubric."
         )
-
-        final_response = chat.send_message(prompt)
+        with st.spinner("Planning your highway trip and evaluating live stops..."):
+            response = chat.send_message(prompt)
+        st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
 
     st.subheader("Your Personalized Highway Itinerary")
-    st.markdown(final_response.text)
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
+    if followup:
+        st.session_state.chat_messages.append({"role": "user", "content": followup})
+        with st.spinner("Thinking..."):
+            response = chat.send_message(followup)
+        st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
+        st.rerun()
