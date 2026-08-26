@@ -8,11 +8,55 @@ from dateutil import parser
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
 import base64
+import csv
+import functools
+import logging
 import os
 import re
+import time
 import dotenv
 
 dotenv.load_dotenv()
+
+# Plain stdout logging -- Streamlit Community Cloud's "Manage app" log viewer shows this directly,
+# no extra setup needed. Kept separate from the usage_log.csv below: this is for "what happened,
+# skim server logs" visibility, the CSV is for "how long is this actually taking, per request".
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("journey_concierge")
+
+# CSV lives next to app.py, not in the repo (gitignored) -- structured per-request timing data for
+# local analysis. Note this resets on every Streamlit Community Cloud restart/redeploy since its
+# filesystem is ephemeral; treat it as a local-dev tool, not a durable analytics store.
+USAGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_log.csv")
+
+
+def log_usage_event(event_type: str, origin: str, destination: str, preferences: str, duration_s: float, tool_trace: list[dict]):
+    """Appends one row per user-facing request (initial plan or follow-up) to usage_log.csv, and
+    mirrors a summary line to stdout. tool_trace is the list of {name, detail, duration_s, ok}
+    dicts collected by @timed_tool during this request -- this is what actually answers "what are
+    people using this for and how long does each part take," not just the total."""
+    tool_summary = "; ".join(f"{t['name']}{t['detail']}({t['duration_s']:.1f}s)" for t in tool_trace)
+    logger.info(
+        "usage event=%s origin=%r destination=%r duration_s=%.2f tool_calls=%d [%s]",
+        event_type, origin, destination, duration_s, len(tool_trace), tool_summary,
+    )
+    try:
+        file_exists = os.path.exists(USAGE_LOG_PATH)
+        with open(USAGE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["timestamp_utc", "event", "origin", "destination", "preferences", "duration_s", "tool_calls"])
+            writer.writerow([
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                event_type,
+                origin,
+                destination,
+                preferences.replace("\n", " ")[:200],
+                f"{duration_s:.2f}",
+                tool_summary,
+            ])
+    except Exception:
+        logger.exception("failed to write usage_log.csv")
 
 
 # Hand-rolled instead of using the `polyline` pip package or Google's Static Maps API (which would
@@ -98,6 +142,63 @@ def get_timezone_for_location(location: str, api_key: str) -> str:
 
 # --- Gemini Tool Definitions ---
 
+_TOOL_LABELS = {
+    "calculate_route_and_etas": "🚗 Calculating route and ETAs",
+    "search_places_along_route": "🔍 Searching along the route",
+    "get_place_details_and_reviews": "📋 Checking reviews, hours, and parking",
+}
+
+
+def _tool_call_detail(name: str, kwargs: dict) -> str:
+    """Short human-readable suffix for a tool call, used both in the live progress status and the
+    usage log -- e.g. what category was searched, or how many places were looked up."""
+    if name == "search_places_along_route":
+        return f" for \"{kwargs.get('category', '')}\""
+    if name == "get_place_details_and_reviews":
+        n = len(kwargs.get('place_ids') or [])
+        return f" ({n} candidate place{'s' if n != 1 else ''})"
+    if name == "calculate_route_and_etas":
+        return f" ({kwargs.get('origin', '')} → {kwargs.get('destination', '')})"
+    return ""
+
+
+def timed_tool(func):
+    """Wraps a Gemini tool function to (1) post a line to the live st.status progress panel as the
+    call starts, and (2) record its name/detail/duration/outcome into st.session_state['_tool_trace']
+    for the usage log. Automatic function calling drives these tool functions synchronously inside
+    one blocking chat.send_message() call, so a live progress panel is the only way to show the user
+    what's happening without a bigger architecture change (see handoff notes on concurrent tool
+    execution) -- this decorator is how each tool reports in.
+
+    functools.wraps preserves __name__/__doc__/__wrapped__ so inspect.signature(wrapper) still
+    resolves to the original function's signature -- required for the genai SDK to build the tool's
+    schema correctly from the wrapped function.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        detail = _tool_call_detail(func.__name__, kwargs)
+        status = st.session_state.get("_progress_status")
+        if status is not None:
+            status.write(f"{_TOOL_LABELS.get(func.__name__, func.__name__)}{detail}...")
+
+        start = time.monotonic()
+        try:
+            result = func(*args, **kwargs)
+            ok = not (isinstance(result, dict) and "error" in result)
+            return result
+        except Exception:
+            ok = False
+            raise
+        finally:
+            duration_s = time.monotonic() - start
+            trace = st.session_state.get("_tool_trace")
+            if trace is not None:
+                trace.append({"name": func.__name__, "detail": detail, "duration_s": duration_s, "ok": ok})
+            logger.info("tool=%s%s duration_s=%.2f ok=%s", func.__name__, detail, duration_s, ok)
+    return wrapper
+
+
+@timed_tool
 def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: str) -> dict:
     """
     Calculates the route between an origin and destination, providing total duration, distance,
@@ -169,6 +270,7 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     }
 
 
+@timed_tool
 def search_places_along_route(encoded_polyline: str, category: str) -> dict:
     """
     Searches for places along an encoded polyline route matching a free-text query.
@@ -245,6 +347,7 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
     return {"places": places}
 
 
+@timed_tool
 def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     """
     Fetches detailed information, operating hours, and top user reviews for MULTIPLE places at once.
@@ -770,8 +873,16 @@ if st.session_state.get('planning_triggered', False):
             "unless my notes actually ask for one. Finally, fetch place details/reviews for the best options and "
             "evaluate them appropriately for what I asked for."
         )
-        with st.spinner("Planning your trip and evaluating live stops..."):
-            response = chat.send_message(prompt)
+        status = st.status("Planning your trip and evaluating live stops...", expanded=True)
+        st.session_state._progress_status = status
+        st.session_state._tool_trace = []
+        start = time.monotonic()
+        response = chat.send_message(prompt)
+        duration_s = time.monotonic() - start
+        status.update(label=f"✅ Plan ready in {duration_s:.1f}s", state="complete")
+        log_usage_event("plan", st.session_state.origin, st.session_state.destination,
+                         st.session_state.preferences, duration_s, st.session_state._tool_trace)
+        st.session_state._progress_status = None
         st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
 
     st.subheader("Your Personalized Journey Plan")
@@ -788,7 +899,15 @@ if st.session_state.get('planning_triggered', False):
     followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
     if followup:
         st.session_state.chat_messages.append({"role": "user", "content": followup})
-        with st.spinner("Thinking..."):
-            response = chat.send_message(followup)
+        status = st.status("Thinking...", expanded=True)
+        st.session_state._progress_status = status
+        st.session_state._tool_trace = []
+        start = time.monotonic()
+        response = chat.send_message(followup)
+        duration_s = time.monotonic() - start
+        status.update(label=f"✅ Answered in {duration_s:.1f}s", state="complete")
+        log_usage_event("followup", st.session_state.origin, st.session_state.destination,
+                         followup, duration_s, st.session_state._tool_trace)
+        st.session_state._progress_status = None
         st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
         st.rerun()
