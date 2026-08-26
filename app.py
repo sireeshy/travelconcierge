@@ -175,6 +175,17 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
             "vicinity": p_data.get('formattedAddress', ''),
             "types": p_data.get('types', [])[:4]
         })
+
+    # Track every discovered place so the UI can offer a "Navigate" link to it later --
+    # the chat response is free-form text, so this is the only reliable source of real place_ids.
+    if 'discovered_places' not in st.session_state:
+        st.session_state.discovered_places = {}
+    for p in places:
+        st.session_state.discovered_places[p['place_id']] = {
+            "name": p['name'],
+            "vicinity": p['vicinity'],
+        }
+
     return {"places": places}
 
 
@@ -281,6 +292,26 @@ def render_copy_and_share(text: str):
         """,
         height=45,
     )
+
+
+def render_navigate_links():
+    """Renders an 'Open in Google Maps' link for every real place discovered so far in this
+    conversation, using Maps' navigation deep link. No origin is set on the link, so Google Maps
+    starts turn-by-turn directions from wherever the phone actually is when it's tapped, which is
+    what you want for an on-the-road pitstop rather than always routing from the planned origin."""
+    places = st.session_state.get('discovered_places', {})
+    if not places:
+        return
+    st.caption("🗺️ Navigate to a suggested stop:")
+    links_html = "".join(
+        f'<a href="https://www.google.com/maps/dir/?api=1&destination={requests.utils.quote(info["name"] + ", " + info["vicinity"])}'
+        f'&destination_place_id={place_id}&travelmode=driving" target="_blank" '
+        'style="display:inline-block; margin:2px 6px 2px 0; padding:5px 12px; border-radius:6px; '
+        'border:1px solid #4285F4; background:#4285F4; color:white; text-decoration:none; font-size:13px;">'
+        f'📍 {info["name"]}</a>'
+        for place_id, info in places.items()
+    )
+    st.markdown(links_html, unsafe_allow_html=True)
 
 
 # --- Streamlit UI ---
@@ -431,6 +462,7 @@ if st.button("Plan My Trip", use_container_width=True):
         # Starting a new plan resets any prior conversation.
         st.session_state.chat = None
         st.session_state.chat_messages = []
+        st.session_state.discovered_places = {}
         st.session_state.need_new_plan = True
 
 if st.session_state.get('planning_triggered', False):
@@ -529,6 +561,8 @@ if st.session_state.get('planning_triggered', False):
             st.markdown(message["content"])
             if message["role"] == "assistant":
                 render_copy_and_share(message["content"])
+
+    render_navigate_links()
 
     followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
     if followup:
