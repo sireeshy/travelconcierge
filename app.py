@@ -4,10 +4,8 @@ from google.genai import types
 import requests
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
-from dateutil import parser
 import json
 import os
-import re
 import dotenv
 
 dotenv.load_dotenv()
@@ -283,43 +281,50 @@ with col2:
         dest_options = [dest_search]
     destination = st.selectbox("🎯 Confirmed Destination (Google Maps)", options=dest_options)
 
-departure_time_str = st.text_input("Departure Time (e.g., '11:30 AM', '630pm', or '2026-08-27T11:30:00Z')", "11:30 AM")
+IST = timezone(timedelta(hours=5, minutes=30))
+now_ist = datetime.now(IST)
 
-# Accept compact times like "630pm" or "630 pm" by inserting the colon dateutil expects.
-_compact_time_match = re.fullmatch(r'(\d{1,2})(\d{2})\s*([AaPp][Mm])', departure_time_str.strip())
-if _compact_time_match:
-    hour, minute, meridiem = _compact_time_match.groups()
-    departure_time_str = f"{hour}:{minute} {meridiem}"
+st.markdown("**Departure Date**")
+date_col1, date_col2, date_col3 = st.columns(3)
+with date_col1:
+    if st.button("Today", use_container_width=True):
+        st.session_state.departure_date = now_ist.date()
+with date_col2:
+    if st.button("Tomorrow", use_container_width=True):
+        st.session_state.departure_date = now_ist.date() + timedelta(days=1)
+with date_col3:
+    if st.button("Day after", use_container_width=True):
+        st.session_state.departure_date = now_ist.date() + timedelta(days=2)
+departure_date = st.date_input(
+    "Departure date", key="departure_date", value=now_ist.date(), label_visibility="collapsed"
+)
+
+st.markdown("**Departure Time**")
+time_col1, time_col2, time_col3 = st.columns(3)
+with time_col1:
+    if st.button("Now", use_container_width=True):
+        st.session_state.departure_time = now_ist.time().replace(microsecond=0)
+with time_col2:
+    if st.button("1 hr from now", use_container_width=True):
+        st.session_state.departure_time = (now_ist + timedelta(hours=1)).time().replace(microsecond=0)
+with time_col3:
+    st.button("Custom", use_container_width=True, disabled=True, help="Pick any time with the selector below")
+departure_time_val = st.time_input(
+    "Departure time", key="departure_time", value=now_ist.time().replace(second=0, microsecond=0),
+    label_visibility="collapsed"
+)
+
 preferences = st.text_area(
     "Preferences / Notes",
     "Traveling with elderly parents, need pure veg and clean restrooms"
 )
 
-IST = timezone(timedelta(hours=5, minutes=30))
-
-try:
-    if 'T' in departure_time_str or '-' in departure_time_str:
-        departure_datetime = parser.parse(departure_time_str)
-        if departure_datetime.tzinfo is None:
-            departure_datetime = departure_datetime.replace(tzinfo=IST)
-    else:
-        # A bare time like "11:30 AM" means the next upcoming occurrence in IST,
-        # since this app plans road trips within India.
-        time_obj = parser.parse(departure_time_str).time()
-        now_ist = datetime.now(IST)
-        departure_datetime = datetime.combine(now_ist.date(), time_obj, tzinfo=IST)
-        if departure_datetime <= now_ist:
-            departure_datetime += timedelta(days=1)
-    departure_time_iso = departure_datetime.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
-except Exception as e:
-    st.error(f"Invalid Departure Time format: {e}")
-    departure_time_iso = None
+departure_datetime = datetime.combine(departure_date, departure_time_val, tzinfo=IST)
+departure_time_iso = departure_datetime.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
 if st.button("Plan My Trip", use_container_width=True):
     if not st.session_state.get("google_maps_api_key") or not st.session_state.get("gemini_api_key"):
         st.warning("Please enter both Google Maps API Key and Gemini API Key in the sidebar.")
-    elif not departure_time_iso:
-        st.warning("Please fix the departure time format.")
     else:
         st.session_state.planning_triggered = True
         st.session_state.origin = origin
