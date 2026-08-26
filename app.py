@@ -284,9 +284,9 @@ def render_copy_and_share(text: str):
 
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="🛣️ Highway Pitstop Concierge", layout="wide")
+st.set_page_config(page_title="🧭 Journey Concierge", layout="wide")
 
-st.title("🛣️ Highway Pitstop Concierge")
+st.title("🧭 Journey Concierge")
 
 # Sidebar for API keys
 with st.sidebar:
@@ -450,8 +450,9 @@ if st.session_state.get('planning_triggered', False):
     ]
 
     system_instruction = (
-        "You are a Thoughtful Indian Highway Concierge. Your goal is to plan an optimal road trip "
-        "for the user and help with whatever stops they actually need along the way — this can include "
+        "You are a Thoughtful Indian Journey Concierge. Your goal is to plan an optimal trip for the user -- "
+        "whether it's a long highway drive between cities or a short trip across town -- and help with "
+        "whatever stops they actually need along the way — this can include "
         "food, restrooms, fuel, pharmacies, ATMs, or errands like picking up snacks, drinks, or groceries. "
         "Read the user's request carefully and search for the specific kind of place that matches it "
         "(e.g. a request for snacks and drinks means a grocery/convenience/liquor store, not a restaurant). "
@@ -468,7 +469,7 @@ if st.session_state.get('planning_triggered', False):
         "When outputting the final plan, include a summary itinerary timeline at the top with departure and stop "
         "arrival times, and mention the estimated toll cost for the route if calculate_route_and_etas returned one. "
         "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) for quick-scan ratings. Provide actual ratings and review snippets. "
-        "The following Highway Parameter Rubric applies specifically when evaluating FOOD stops (skip it for "
+        "The following Trip Stop Rubric applies specifically when evaluating FOOD stops (skip it for "
         "non-food stops like shops, fuel, or pharmacies, and instead just note hours, ratings, and anything "
         "relevant from reviews): explicitly state if it's 'Pure Veg', 'Veg & Non-Veg', or 'Fast Food/Chains'; "
         "if traveling with elders, flag places with no traditional Indian meals (Roti/Dal/Thali) as ⚠️; "
@@ -509,7 +510,7 @@ if st.session_state.get('planning_triggered', False):
     if st.session_state.get('need_new_plan', False):
         st.session_state.need_new_plan = False
         prompt = (
-            f"Plan a highway trip from {st.session_state.origin} to {st.session_state.destination}. "
+            f"Plan a trip from {st.session_state.origin} to {st.session_state.destination}. "
             f"My departure time is {st.session_state.departure_time_iso}. "
             f"Here are my preferences/notes: {st.session_state.preferences}. "
             "First, calculate the route and ETAs. Next, based on what I actually need (see my preferences/notes "
@@ -518,11 +519,11 @@ if st.session_state.get('planning_triggered', False):
             "unless my notes actually ask for one. Finally, fetch place details/reviews for the best options and "
             "evaluate them appropriately for what I asked for."
         )
-        with st.spinner("Planning your highway trip and evaluating live stops..."):
+        with st.spinner("Planning your trip and evaluating live stops..."):
             response = chat.send_message(prompt)
         st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
 
-    st.subheader("Your Personalized Highway Itinerary")
+    st.subheader("Your Personalized Journey Plan")
     for message in st.session_state.chat_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
