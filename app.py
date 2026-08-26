@@ -1,5 +1,5 @@
 import streamlit as st
-import streamlit.components.v1 as components
+import pydeck as pdk
 import google.genai as genai
 from google.genai import types
 import requests
@@ -13,6 +13,34 @@ import re
 import dotenv
 
 dotenv.load_dotenv()
+
+
+# Hand-rolled instead of using the `polyline` pip package or Google's Static Maps API (which would
+# draw the map for us) -- Static Maps API needs a separate Cloud Console enablement most keys won't
+# have by default (this app hit that wall repeatedly with other "one more API" surprises), and the
+# decode algorithm itself is short, stable, and dependency-free. See render_route_map() below.
+def decode_polyline(encoded: str) -> list[tuple[float, float]]:
+    """Decodes a Google-encoded polyline string into a list of (lat, lng) points."""
+    points = []
+    index = lat = lng = 0
+    length = len(encoded)
+    while index < length:
+        for is_lat in (True, False):
+            shift = result = 0
+            while True:
+                b = ord(encoded[index]) - 63
+                index += 1
+                result |= (b & 0x1f) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            delta = ~(result >> 1) if result & 1 else (result >> 1)
+            if is_lat:
+                lat += delta
+            else:
+                lng += delta
+        points.append((lat / 1e5, lng / 1e5))
+    return points
 
 _timezone_finder = TimezoneFinder()
 
@@ -94,6 +122,8 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
         "computeAlternativeRoutes": False,
         "languageCode": "en-US",
         "units": "METRIC",
+        # Toll estimates are opt-in: extraComputations must list "TOLLS", and the API requires
+        # routeModifiers.vehicleInfo to be present (any value) before it will compute a price.
         "extraComputations": ["TOLLS"],
         "routeModifiers": {"vehicleInfo": {"emissionType": "GASOLINE"}}
     }
@@ -112,6 +142,10 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
         legs.append({
             "duration_seconds": int(leg_data['duration'].replace('s', '')),
             "distance_meters": leg_data['distanceMeters'],
+            # There is no legs.startAddress/endAddress field in Routes API v2 (that's a legacy
+            # Directions API field name that silently 400s here) -- since this app never passes
+            # waypoints, computeRoutes always returns exactly one leg spanning origin->destination,
+            # so the function's own params are a safe stand-in for the address strings.
             "end_address": destination,
             "start_address": origin,
             "encoded_polyline": leg_data['polyline']['encodedPolyline']
@@ -122,6 +156,9 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     if toll_prices:
         price = toll_prices[0]
         estimated_toll = f"{price.get('units', '0')}.{price.get('nanos', 0) // 10_000_000:02d} {price.get('currencyCode', '')}".strip()
+
+    # Not sent to the model -- stashed for the UI to draw the route on a map.
+    st.session_state.route_polyline = route['polyline']['encodedPolyline']
 
     return {
         "total_duration_seconds": int(route['duration'].replace('s', '')),
@@ -136,6 +173,12 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
     """
     Searches for places along an encoded polyline route matching a free-text query.
 
+    'category' has no default value on purpose: it used to default to "restaurant", which meant
+    the model would silently fall back to restaurant searches for any request it didn't reason
+    carefully about (e.g. "pick up snacks and drinks" still returned restaurants). Making it
+    required, plus the system prompt's explicit "don't default to restaurants" instruction, forces
+    the model to actually decide what kind of place fits the request.
+
     'category' is a natural-language search query for whatever the user actually needs along the
     route -- not limited to food. Pick a query that matches their request, e.g. "vegetarian
     restaurant", "clean public restroom", "grocery store", "liquor store", "convenience store
@@ -146,6 +189,10 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
     if not api_key:
         return {"error": "Google Maps API Key is not set in the sidebar."}
 
+    # There is no dedicated "search along route" endpoint in the Places API (New) -- that's a
+    # parameter (searchAlongRouteParameters) on ordinary Text Search, not its own URL. An earlier
+    # version of this app called a nonexistent places:searchAlongRoute endpoint, which 404'd every
+    # time and drove the model to hallucinate a placeholder place_id to keep going.
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",
@@ -162,10 +209,18 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
 
     response = requests.post(url, headers=headers, json=data)
     if not response.ok:
+        # This call fails occasionally and transiently even with a valid, well-formed request --
+        # observed once with a real 360km route that a direct retry of the identical request
+        # immediately succeeded on. This print is deliberately kept (error path only, not per-call)
+        # so a recurrence shows up in server logs with enough detail to tell transient flakiness
+        # apart from a real, reproducible request problem.
+        print(f"[search_places_along_route] category={category!r} polyline_len={len(encoded_polyline)} HTTP {response.status_code}: {response.text}", flush=True)
         return {"error": f"Places API error {response.status_code}: {response.text}"}
     places_data = response.json()
 
     places = []
+    if 'discovered_places' not in st.session_state:
+        st.session_state.discovered_places = {}
     for p_data in places_data.get('places', [])[:5]:
         places.append({
             "place_id": p_data['id'],
@@ -176,14 +231,15 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
             "types": p_data.get('types', [])[:4]
         })
 
-    # Track every discovered place so the UI can offer a "Navigate" link to it later --
-    # the chat response is free-form text, so this is the only reliable source of real place_ids.
-    if 'discovered_places' not in st.session_state:
-        st.session_state.discovered_places = {}
-    for p in places:
-        st.session_state.discovered_places[p['place_id']] = {
-            "name": p['name'],
-            "vicinity": p['vicinity'],
+        # Track every discovered place so the UI can offer a "Navigate" link and a map marker for
+        # it later -- the chat response is free-form text, so this is the only reliable source of
+        # real place_ids and coordinates. Lat/lng isn't sent to the model, just stashed for the UI.
+        location = p_data.get('location', {})
+        st.session_state.discovered_places[p_data['id']] = {
+            "name": p_data['displayName']['text'],
+            "vicinity": p_data.get('formattedAddress', ''),
+            "lat": location.get('latitude'),
+            "lng": location.get('longitude'),
         }
 
     return {"places": places}
@@ -194,6 +250,11 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     Fetches detailed information, operating hours, and top user reviews for MULTIPLE places at once.
     Pass every candidate place_id from search_places_along_route in a single call (do not call this
     once per place) so all pitstop options are evaluated together.
+
+    This is intentionally batched (one call per plan, not one per place) because the automatic
+    function-calling loop that drives this app has a capped number of round trips
+    (see maximum_remote_calls below) -- evaluating 5 candidate places used to cost 5 of that budget
+    on its own, which was the dominant reason plans ran out of calls before producing a final answer.
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
@@ -202,7 +263,9 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "id,displayName.text,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,currentOpeningHours,priceLevel,regularOpeningHours,reviews,servesBreakfast,servesLunch,servesDinner,servesVegetarianFood,parkingOptions"
+        # currentOpeningStatus is NOT a real field on the Place resource (it 400s) -- the actual
+        # field for "is it open right now" is currentOpeningHours.openNow, mapped below.
+        "X-Goog-FieldMask": "id,displayName.text,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,currentOpeningHours,priceLevel,regularOpeningHours,reviews,servesBreakfast,servesLunch,servesDinner,servesVegetarianFood,parkingOptions,photos"
     }
 
     results = []
@@ -253,6 +316,11 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
             "parking_available": available_parking if available_parking else "Not listed by Google -- mention this is unverified if parking matters for this trip"
         })
 
+        # Not sent to the model (not useful context, just tokens) -- stashed for the UI to render a photo.
+        photos = details_data.get('photos', [])
+        if place_id in st.session_state.get('discovered_places', {}) and photos:
+            st.session_state.discovered_places[place_id]['photo_name'] = photos[0]['name']
+
     return {"details": results}
 
 
@@ -265,8 +333,8 @@ def render_copy_and_share(text: str):
     """
     b64 = base64.b64encode(text.encode('utf-8')).decode('ascii')
     # st.markdown(unsafe_allow_html=True) sanitizes out inline event handlers (onclick etc.),
-    # so this needs an actual iframe via components.html instead, which allows real JS.
-    components.html(
+    # so this needs an actual iframe via st.iframe instead, which allows real JS.
+    st.iframe(
         f"""
         <div style="display:flex; gap:8px; font-family:sans-serif;">
           <button onclick="
@@ -295,23 +363,109 @@ def render_copy_and_share(text: str):
 
 
 def render_navigate_links():
-    """Renders an 'Open in Google Maps' link for every real place discovered so far in this
-    conversation, using Maps' navigation deep link. No origin is set on the link, so Google Maps
-    starts turn-by-turn directions from wherever the phone actually is when it's tapped, which is
-    what you want for an on-the-road pitstop rather than always routing from the planned origin."""
+    """Lets the user pick which discovered places to actually use as stops, in visit order, then
+    renders one Google Maps link with the whole route: current location -> stop(s) -> trip
+    destination, using Maps' waypoints so every selected stop is set automatically in one tap
+    instead of navigating to each place separately."""
     places = st.session_state.get('discovered_places', {})
     if not places:
         return
-    st.caption("🗺️ Navigate to a suggested stop:")
-    links_html = "".join(
-        f'<a href="https://www.google.com/maps/dir/?api=1&destination={requests.utils.quote(info["name"] + ", " + info["vicinity"])}'
-        f'&destination_place_id={place_id}&travelmode=driving" target="_blank" '
-        'style="display:inline-block; margin:2px 6px 2px 0; padding:5px 12px; border-radius:6px; '
-        'border:1px solid #4285F4; background:#4285F4; color:white; text-decoration:none; font-size:13px;">'
-        f'📍 {info["name"]}</a>'
-        for place_id, info in places.items()
+    st.caption("🗺️ Build your route:")
+    labels = [info['name'] for info in places.values()]
+    label_to_id = {info['name']: place_id for place_id, info in places.items()}
+    selected = st.multiselect(
+        "Pick stops to include, in the order you'll visit them",
+        options=labels,
+        key="route_stops_selected",
     )
-    st.markdown(links_html, unsafe_allow_html=True)
+    if not selected:
+        st.caption("Select one or more stops above, then get one link with your whole route set up in Maps.")
+        return
+
+    waypoints = "|".join(
+        requests.utils.quote(f"{places[label_to_id[name]]['name']}, {places[label_to_id[name]]['vicinity']}")
+        for name in selected
+    )
+    destination = requests.utils.quote(st.session_state.get('destination', ''))
+    maps_url = (
+        f"https://www.google.com/maps/dir/?api=1&destination={destination}"
+        f"&waypoints={waypoints}&travelmode=driving"
+    )
+    st.markdown(
+        f'<a href="{maps_url}" target="_blank" style="display:inline-block; margin-top:4px; padding:8px 16px; '
+        'border-radius:6px; border:1px solid #4285F4; background:#4285F4; color:white; text-decoration:none; '
+        'font-weight:600; font-size:14px;">🗺️ Get Directions with Selected Stops</a>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_route_map():
+    """Draws the calculated route (decoded from its polyline) with a marker for every discovered
+    place, so the user can see the trip and stops at a glance instead of only reading about them."""
+    polyline = st.session_state.get('route_polyline')
+    if not polyline:
+        return
+    path = decode_polyline(polyline)
+    if not path:
+        return
+
+    layers = [pdk.Layer(
+        "PathLayer",
+        data=[{"path": [[lng, lat] for lat, lng in path]}],
+        get_path="path",
+        get_width=5,
+        get_color=[66, 133, 244],
+        width_min_pixels=3,
+    )]
+
+    places = st.session_state.get('discovered_places', {})
+    marker_data = [
+        {"lat": info['lat'], "lng": info['lng'], "name": info['name']}
+        for info in places.values() if info.get('lat') is not None
+    ]
+    if marker_data:
+        layers.append(pdk.Layer(
+            "ScatterplotLayer",
+            data=marker_data,
+            get_position=["lng", "lat"],
+            get_fill_color=[234, 67, 53],
+            get_radius=300,
+            pickable=True,
+        ))
+
+    mid_lat, mid_lng = path[len(path) // 2]
+    st.caption("🗺️ Route Map:")
+    st.pydeck_chart(pdk.Deck(
+        map_style=None,
+        initial_view_state=pdk.ViewState(latitude=mid_lat, longitude=mid_lng, zoom=8),
+        layers=layers,
+        tooltip={"text": "{name}"} if marker_data else None,
+    ))
+
+
+def render_place_photos():
+    """Shows a photo for each discovered place that has one. Fetched server-side (not linked
+    directly as an <img src>) so the Maps API key is never exposed to the browser."""
+    places = st.session_state.get('discovered_places', {})
+    photo_entries = [(info['name'], info['photo_name']) for info in places.values() if info.get('photo_name')]
+    api_key = st.session_state.get('google_maps_api_key')
+    if not photo_entries or not api_key:
+        return
+
+    st.caption("📸 Photos:")
+    cols = st.columns(min(len(photo_entries), 4))
+    for i, (name, photo_name) in enumerate(photo_entries[:4]):
+        try:
+            resp = requests.get(
+                f"https://places.googleapis.com/v1/{photo_name}/media",
+                params={"maxWidthPx": 400, "key": api_key},
+                timeout=5,
+            )
+            if resp.ok:
+                with cols[i % len(cols)]:
+                    st.image(resp.content, caption=name, width='stretch')
+        except Exception:
+            pass
 
 
 # --- Streamlit UI ---
@@ -369,15 +523,19 @@ now_local = datetime.now(origin_tz)
 st.caption(f"🕐 Times below are local time at your origin ({origin_tz_name.replace('_', ' ')}).")
 
 st.markdown("**Departure Date**")
+# Pattern for all three quick-select button rows in this file (date, then time below): writing to
+# st.session_state[key] BEFORE the widget with that key is instantiated overrides its value for
+# this rerun. Doing it the other way around (setting state after the widget call) raises, since
+# Streamlit already owns that key by then -- the buttons must run first in the script.
 date_col1, date_col2, date_col3 = st.columns(3)
 with date_col1:
-    if st.button("Today", use_container_width=True):
+    if st.button("Today", width='stretch'):
         st.session_state.departure_date = now_local.date()
 with date_col2:
-    if st.button("Tomorrow", use_container_width=True):
+    if st.button("Tomorrow", width='stretch'):
         st.session_state.departure_date = now_local.date() + timedelta(days=1)
 with date_col3:
-    if st.button("Day after", use_container_width=True):
+    if st.button("Day after", width='stretch'):
         st.session_state.departure_date = now_local.date() + timedelta(days=2)
 departure_date = st.date_input(
     "Departure date", key="departure_date", value=now_local.date(), label_visibility="collapsed"
@@ -389,13 +547,13 @@ def _format_time_12h(t):
 st.markdown("**Departure Time**")
 time_col1, time_col2, time_col3 = st.columns(3)
 with time_col1:
-    if st.button("Now", use_container_width=True):
+    if st.button("Now", width='stretch'):
         st.session_state.departure_time_text = _format_time_12h(now_local)
 with time_col2:
-    if st.button("1 hr from now", use_container_width=True):
+    if st.button("1 hr from now", width='stretch'):
         st.session_state.departure_time_text = _format_time_12h(now_local + timedelta(hours=1))
 with time_col3:
-    st.button("Custom", use_container_width=True, disabled=True, help="Type any time below, e.g. '630pm' or '6:30 PM'")
+    st.button("Custom", width='stretch', disabled=True, help="Type any time below, e.g. '630pm' or '6:30 PM'")
 departure_time_str = st.text_input(
     "Departure time", key="departure_time_text", value=_format_time_12h(now_local),
     label_visibility="collapsed"
@@ -448,7 +606,7 @@ except Exception as e:
     st.error(f"Invalid time format: {e}")
     departure_time_iso = None
 
-if st.button("Plan My Trip", use_container_width=True):
+if st.button("Plan My Trip", width='stretch'):
     if not st.session_state.get("google_maps_api_key") or not st.session_state.get("gemini_api_key"):
         st.warning("Please enter both Google Maps API Key and Gemini API Key in the sidebar.")
     elif not departure_time_iso:
@@ -459,10 +617,14 @@ if st.button("Plan My Trip", use_container_width=True):
         st.session_state.destination = destination
         st.session_state.departure_time_iso = departure_time_iso
         st.session_state.preferences = preferences
-        # Starting a new plan resets any prior conversation.
+        # Starting a new plan resets any prior conversation and everything the UI derived from it
+        # (map, photos, navigate links all key off discovered_places/route_polyline) -- without this,
+        # stale places/route from a previous trip would linger into the new one's map and stop list.
         st.session_state.chat = None
         st.session_state.chat_messages = []
         st.session_state.discovered_places = {}
+        st.session_state.route_stops_selected = []
+        st.session_state.route_polyline = None
         st.session_state.need_new_plan = True
 
 if st.session_state.get('planning_triggered', False):
@@ -481,6 +643,28 @@ if st.session_state.get('planning_triggered', False):
         types.Tool(google_search=types.GoogleSearch())
     ]
 
+    # This prompt has been hardened against specific failure modes actually observed while building
+    # this app, not written speculatively -- each numbered point below maps to a paragraph/bullet in
+    # the text and is worth understanding before editing it:
+    #   1. Early versions were framed entirely around "highway food/restroom pitstops," so the model
+    #      defaulted every request (even "buy snacks for a friend visit") into a restaurant-shaped
+    #      answer. The "don't default to restaurants" + "think like a concierge, not a search tool"
+    #      framing exists specifically to break that bias -- see also search_places_along_route's
+    #      required (no-default) `category` param above, which was the other half of that fix.
+    #   2. When search_places_along_route failed, the model would quietly substitute restaurant names
+    #      recalled from its own training data or a raw google_search instead of admitting the live
+    #      search failed. Verified against live Places data: of 5 such recalled names, 3 were
+    #      permanently closed and 1 was in the wrong city/state entirely -- i.e. this is a real,
+    #      demonstrated risk for someone about to drive there with elderly parents, not a
+    #      theoretical one. The explicit "do not fall back to naming places from your own knowledge"
+    #      instruction exists specifically to prevent that.
+    #   3. google_search is scoped narrowly (only to double-check a place search already found with
+    #      few reviews) for the same reason -- without that scoping, the model would reach for it as
+    #      a substitute discovery mechanism whenever the primary tool had a rough result.
+    #   4. The proactive-timing paragraph (meal windows / biobreaks / late-night driving) was added
+    #      because the app only reacted to what was explicitly asked for, missing the kind of
+    #      forward-thinking a real concierge would offer unprompted (e.g. noting a very late arrival
+    #      time, or that dinner-hour timing means suggesting food even if only fuel was requested).
     system_instruction = (
         "You are a Thoughtful Indian Journey Concierge. Your goal is to plan an optimal trip for the user -- "
         "whether it's a long highway drive between cities or a short trip across town -- and help with "
@@ -502,6 +686,13 @@ if st.session_state.get('planning_triggered', False):
         "Do not make up information. Only use the tools provided to gather information. "
         "If a tool call returns an error, do not retry it with guessed or reformatted inputs and do not invent "
         "place IDs or details — report the limitation to the user instead. "
+        "This applies to search_places_along_route specifically: if it errors, do not fall back to naming "
+        "specific restaurants/places from your own knowledge or a general google_search, even with a caveat -- "
+        "unverified place names routinely turn out to be permanently closed, in the wrong city, or simply "
+        "nonexistent, which is worse than no recommendation for someone actually about to drive there. Instead, "
+        "tell the user the live place search hit a temporary issue and suggest they try again. "
+        "google_search is only for double-checking a place get_place_details_and_reviews already returned with "
+        "very few reviews, not for discovering new candidate places when search_places_along_route fails. "
         "When calculating ETAs, consider the 'departure_time_iso' for traffic. "
         "Always try to find multiple suitable options, but call search_places_along_route at most once per kind of stop needed. "
         "Call get_place_details_and_reviews exactly once, passing the place_ids of every candidate place "
@@ -523,9 +714,12 @@ if st.session_state.get('planning_triggered', False):
         "~12:30-3pm, dinner ~7:30-10:30pm). If the journey overlaps one, proactively suggest a food stop timed to "
         "that point even if the user only asked for something else like fuel or snacks -- people traveling around "
         "mealtimes usually want to eat too. "
-        "- If the total drive duration exceeds 2 hours, proactively recommend periodic biobreaks (restroom plus a "
-        "chance to stretch/rehydrate) even if not requested, not just once -- for 4+ hour trips, space out more "
-        "than one break through the journey rather than a single stop near the start. "
+        "- Call search_places_along_route with a query like 'clean public restroom' or 'rest area' -- and include "
+        "a distinct '🚻 Restroom Stops' section with real results from it -- only when the total drive duration "
+        "exceeds 2 hours, or when the user specifically asked for restrooms regardless of trip length. Don't run "
+        "this search for short trips unless it was actually requested. When it does apply, don't consider a food "
+        "stop's restroom sufficient on its own, since it may not land at a convenient point in the drive; for 4+ "
+        "hour trips, look for more than one restroom option spaced through the journey rather than one near the start. "
         "- If departure or a significant part of the drive falls late at night (roughly 10pm-5am), note that fewer "
         "places will be open and consider suggesting a tea/coffee stop for driver alertness. "
         "If a promising place has very few reviews (roughly under 10) and you're unsure it's reliable -- e.g. it "
@@ -538,8 +732,16 @@ if st.session_state.get('planning_triggered', False):
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         tools=gemini_tools,
-        # Required to mix our custom function-calling tools with the built-in Google Search tool.
+        # Required to mix our custom function-calling tools with the built-in Google Search tool --
+        # omitting this gives a 400 telling you to set exactly this flag.
         tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
+        # The SDK default is 10. A typical plan now needs ~3-6 calls (route + 1-2 category searches
+        # + one batched details call), well under that -- this is headroom for multi-need requests
+        # (e.g. food + fuel + restrooms all in one trip) plus the occasional google_search
+        # verification, not a response to normal usage running out. If the AFC loop exhausts this
+        # budget mid-plan, the model's last turn is left holding an unresolved function_call with no
+        # text response, which surfaces in the UI as a literal "None" -- if that recurs, the fix is
+        # more budget here or fewer categories per plan, not a UI-side workaround.
         automatic_function_calling=types.AutomaticFunctionCallingConfig(
             maximum_remote_calls=15
         )
@@ -579,6 +781,8 @@ if st.session_state.get('planning_triggered', False):
             if message["role"] == "assistant":
                 render_copy_and_share(message["content"])
 
+    render_route_map()
+    render_place_photos()
     render_navigate_links()
 
     followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
