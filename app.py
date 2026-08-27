@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import base64
 import csv
 import functools
+import json
 import logging
 import os
 import re
@@ -30,22 +31,40 @@ logger = logging.getLogger("journey_concierge")
 USAGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_log.csv")
 
 
-def log_usage_event(event_type: str, origin: str, destination: str, preferences: str, duration_s: float, tool_trace: list[dict]):
+USAGE_LOG_HEADER = [
+    "timestamp_utc", "event", "origin", "destination", "preferences", "duration_s",
+    "tool_calls", "tool_errors", "structured_ok", "response_type",
+]
+
+
+def log_usage_event(event_type: str, origin: str, destination: str, preferences: str, duration_s: float,
+                     tool_trace: list[dict], response_meta: dict):
     """Appends one row per user-facing request (initial plan or follow-up) to usage_log.csv, and
     mirrors a summary line to stdout. tool_trace is the list of {name, detail, duration_s, ok}
-    dicts collected by @timed_tool during this request -- this is what actually answers "what are
-    people using this for and how long does each part take," not just the total."""
+    dicts collected by @timed_tool during this request. response_meta is the {structured_ok,
+    response_type} dict from response_to_markdown.
+
+    Beyond timing, this is the performance signal for two things that can silently degrade without
+    anyone noticing in a chat UI: tool_errors catches Maps/Places API failures (see the transient
+    search_places_along_route error noted in HANDOFF.md), and structured_ok catches the
+    structured-output-plus-tools combo (a preview feature as of this writing, see the comment above
+    CONCIERGE_RESPONSE_SCHEMA) silently reverting to unparsed text. Both are invisible to a user who
+    just sees *a* plan and has no earlier run to compare against.
+    """
     tool_summary = "; ".join(f"{t['name']}{t['detail']}({t['duration_s']:.1f}s)" for t in tool_trace)
+    tool_errors = sum(1 for t in tool_trace if not t.get("ok", True))
     logger.info(
-        "usage event=%s origin=%r destination=%r duration_s=%.2f tool_calls=%d [%s]",
-        event_type, origin, destination, duration_s, len(tool_trace), tool_summary,
+        "usage event=%s origin=%r destination=%r duration_s=%.2f tool_calls=%d tool_errors=%d "
+        "structured_ok=%s response_type=%s [%s]",
+        event_type, origin, destination, duration_s, len(tool_trace), tool_errors,
+        response_meta.get("structured_ok"), response_meta.get("response_type"), tool_summary,
     )
     try:
         file_exists = os.path.exists(USAGE_LOG_PATH)
         with open(USAGE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["timestamp_utc", "event", "origin", "destination", "preferences", "duration_s", "tool_calls"])
+                writer.writerow(USAGE_LOG_HEADER)
             writer.writerow([
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 event_type,
@@ -54,6 +73,9 @@ def log_usage_event(event_type: str, origin: str, destination: str, preferences:
                 preferences.replace("\n", " ")[:200],
                 f"{duration_s:.2f}",
                 tool_summary,
+                tool_errors,
+                response_meta.get("structured_ok"),
+                response_meta.get("response_type"),
             ])
     except Exception:
         logger.exception("failed to write usage_log.csv")
@@ -140,6 +162,46 @@ def get_timezone_for_location(location: str, api_key: str) -> str:
             pass
     return "Asia/Kolkata"
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_wikipedia_thumbnail(place_name: str) -> dict | None:
+    """Looks up a Wikipedia summary (title, thumbnail image, page link) for a place name via
+    Wikipedia's public REST API -- no key needed. This is what backs the "region imagery" side
+    panel: real, freely-licensed photos (Wikipedia article images live on Wikimedia Commons, all
+    under a free license) tied to whatever origin/destination the user actually searched for, not a
+    fixed demo set baked in for one route.
+
+    A descriptive User-Agent is required -- Wikimedia's CDN silently serves an HTML error page
+    instead of the image/JSON for requests that don't identify themselves
+    (https://meta.wikimedia.org/wiki/User-Agent_policy), which is exactly what happened testing this
+    with a plain curl request before adding one here.
+
+    The confirmed place string from Places Autocomplete looks like "Anantapur, Andhra Pradesh,
+    India" -- the first comma-separated segment is a reasonable Wikipedia article title guess for
+    an Indian town/city, though it isn't guaranteed for every place name."""
+    title = place_name.split(",")[0].strip()
+    if not title:
+        return None
+    try:
+        response = requests.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(title)}",
+            headers={"User-Agent": "JourneyConcierge/1.0 (travel-planning side project; contact via GitHub sireeshy/travelconcierge)"},
+            timeout=5,
+        )
+        if not response.ok:
+            return None
+        data = response.json()
+        thumbnail_url = data.get("thumbnail", {}).get("source")
+        if not thumbnail_url:
+            return None
+        return {
+            "title": data.get("title", title),
+            "thumbnail_url": thumbnail_url,
+            "page_url": data.get("content_urls", {}).get("desktop", {}).get("page"),
+        }
+    except Exception:
+        return None
+
 # --- Gemini Tool Definitions ---
 
 _TOOL_LABELS = {
@@ -206,7 +268,7 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
-        return {"error": "Google Maps API Key is not set in the sidebar."}
+        return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
     url = "https://routes.googleapis.com/directions/v2:computeRoutes"
     headers = {
@@ -289,7 +351,7 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
-        return {"error": "Google Maps API Key is not set in the sidebar."}
+        return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
     # There is no dedicated "search along route" endpoint in the Places API (New) -- that's a
     # parameter (searchAlongRouteParameters) on ordinary Text Search, not its own URL. An earlier
@@ -361,7 +423,7 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
-        return {"error": "Google Maps API Key is not set in the sidebar."}
+        return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
     headers = {
         "Content-Type": "application/json",
@@ -466,29 +528,72 @@ def render_copy_and_share(text: str):
 
 
 def render_navigate_links():
-    """Lets the user pick which discovered places to actually use as stops, in visit order, then
-    renders one Google Maps link with the whole route: current location -> stop(s) -> trip
-    destination, using Maps' waypoints so every selected stop is set automatically in one tap
-    instead of navigating to each place separately."""
+    """Lets the user pick their stops, then renders one Google Maps link with the whole route:
+    current location -> stop(s) -> trip destination, using Maps' waypoints so every selected stop is
+    set automatically in one tap instead of navigating to each place separately.
+
+    Picking now means choosing one option per category from the plan actually presented (the same
+    categories/options rendered as cards above), not a flat dropdown of every place the app happened
+    to look up -- so the choice you make here is the same choice you just read about, not a second,
+    disconnected selection step. Falls back to the old flat multiselect of every discovered place
+    only if there's no structured plan to read categories from (e.g. structured output didn't parse
+    this turn -- see the preview-feature note above CONCIERGE_RESPONSE_SCHEMA)."""
+    plan = st.session_state.get('latest_plan')
     places = st.session_state.get('discovered_places', {})
     if not places:
         return
+
     st.caption("🗺️ Build your route:")
-    labels = [info['name'] for info in places.values()]
-    label_to_id = {info['name']: place_id for place_id, info in places.items()}
-    selected = st.multiselect(
-        "Pick stops to include, in the order you'll visit them",
-        options=labels,
-        key="route_stops_selected",
-    )
+
+    # selected holds (display_name, place_id_or_None) pairs -- place_id is how a choice gets
+    # resolved to a real address below. Matching by name alone doesn't work reliably: the model's
+    # structured option.name (e.g. "Public Toilet (Court Road, Gulzarpet)") is often a more
+    # descriptive rewrite of the raw Places displayName stored in discovered_places (e.g. plain
+    # "TOILET"), so an exact-string lookup silently drops real selections -- observed directly
+    # while testing this, not a theoretical concern.
+    selected = []
+    if plan and plan.get('stop_categories'):
+        for category in plan['stop_categories']:
+            options = category.get('options') or []
+            if not options:
+                continue
+            option_names = [opt.get('name', 'Unknown') for opt in options]
+            choice = st.radio(
+                category.get('title', 'Choose one'),
+                options=option_names,
+                index=None,
+                horizontal=True,
+                key=f"stop_choice_{category.get('title', '')}",
+            )
+            if choice:
+                chosen = next((o for o in options if o.get('name', 'Unknown') == choice), {})
+                selected.append((choice, chosen.get('place_id')))
+    else:
+        labels = [info['name'] for info in places.values()]
+        picked = st.multiselect(
+            "Pick stops to include, in the order you'll visit them",
+            options=labels,
+            key="route_stops_selected",
+        )
+        selected = [(name, None) for name in picked]
+
     if not selected:
-        st.caption("Select one or more stops above, then get one link with your whole route set up in Maps.")
+        st.caption("Choose a stop above for each category you need, then get one link with your whole route set up in Maps.")
         return
 
-    waypoints = "|".join(
-        requests.utils.quote(f"{places[label_to_id[name]]['name']}, {places[label_to_id[name]]['vicinity']}")
-        for name in selected
-    )
+    name_to_place = {info['name']: info for info in places.values()}
+    waypoint_parts = []
+    for name, place_id in selected:
+        place = places.get(place_id) or name_to_place.get(name)
+        # Fall back to the plan's own descriptive name as the waypoint text itself when neither
+        # place_id nor an exact name match resolves -- Maps can usually still geocode a specific
+        # description like "Public Toilet, Court Road, Gulzarpet", it's just less precise than a
+        # verified formatted address, and it beats dropping the stop the user actually picked.
+        waypoint_parts.append(
+            requests.utils.quote(f"{place['name']}, {place['vicinity']}") if place
+            else requests.utils.quote(f"{name}, near {st.session_state.get('destination', '')}")
+        )
+    waypoints = "|".join(waypoint_parts)
     destination = requests.utils.quote(st.session_state.get('destination', ''))
     maps_url = (
         f"https://www.google.com/maps/dir/?api=1&destination={destination}"
@@ -571,33 +676,620 @@ def render_place_photos():
             pass
 
 
+# Generic "spirit of travel" illustrations shown when a place has no Wikipedia thumbnail -- an
+# uncommon town, a disambiguation-only title, or just a lookup miss shouldn't make the region panel
+# go blank for a real trip someone is actually planning. Two distinct scenes (not one repeated) so
+# origin and destination don't show the identical fallback when both lack a photo. Kept as plain
+# self-contained SVG -- no external asset, no license question, renders anywhere.
+_TRAVEL_SPIRIT_SVGS = [
+    # Open road at dawn: the drive itself.
+    """<svg viewBox="0 0 400 240" xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="sky1" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#fcd9a8"/><stop offset="55%" stop-color="#f2a25c"/><stop offset="100%" stop-color="#d9714a"/>
+        </linearGradient></defs>
+        <rect width="400" height="240" fill="url(#sky1)"/>
+        <circle cx="200" cy="150" r="34" fill="#fff3d6" opacity="0.9"/>
+        <polygon points="0,240 0,190 130,150 0,240" fill="#3a2a1f" opacity="0.85"/>
+        <polygon points="400,240 400,190 270,150 400,240" fill="#241a12" opacity="0.9"/>
+        <polygon points="130,150 270,150 340,240 60,240" fill="#171310"/>
+        <g fill="#f5d9a0"><rect x="196" y="168" width="8" height="14"/><rect x="190" y="192" width="10" height="16"/><rect x="180" y="218" width="14" height="18"/></g>
+        <path d="M56 62 q10 -8 20 0 q10 -8 20 0" stroke="#241a12" stroke-width="2" fill="none" opacity="0.6"/>
+        <path d="M300 42 q10 -8 20 0 q10 -8 20 0" stroke="#241a12" stroke-width="2" fill="none" opacity="0.6"/>
+    </svg>""",
+    # Compass and route: the planning itself.
+    """<svg viewBox="0 0 400 240" xmlns="http://www.w3.org/2000/svg">
+        <rect width="400" height="240" fill="#eef1ea"/>
+        <path d="M40 190 C 120 60, 260 220, 360 70" fill="none" stroke="#c9603f" stroke-width="3" stroke-dasharray="2 10" stroke-linecap="round"/>
+        <circle cx="40" cy="190" r="6" fill="#123f30"/><circle cx="360" cy="70" r="6" fill="#c9603f"/>
+        <g transform="translate(200,120)">
+          <circle r="46" fill="none" stroke="#5b6b62" stroke-width="2"/><circle r="3" fill="#5b6b62"/>
+          <polygon points="0,-40 8,-4 0,-10 -8,-4" fill="#c9603f"/><polygon points="0,40 8,4 0,10 -8,4" fill="#5b6b62"/>
+          <text x="0" y="-52" text-anchor="middle" font-family="monospace" font-size="10" fill="#5b6b62">N</text>
+        </g>
+    </svg>""",
+]
+
+# Shown on the landing page, before any trip is planned. One iconic destination (the Hoysaleswara
+# twin shrines at Halebeedu, on their signature stepped star-shaped plinth) and one legendary human
+# creation for travel itself (the dockyard at Lothal, a Harappan port city -- among the earliest
+# known dockyards in the world, ~2400 BCE, a brick-lined basin linked to the sea by an inlet channel,
+# with the warehouse platform's grid of storage bays alongside it). Same reasoning as the fallback
+# set above: original illustration, not a licensing question, self-contained.
+# Wide banner format (not boxed postcards) meant to sit as a slim decorative strip, not a captioned
+# photo -- the density comes from SVG <pattern> fills (running-bond brick coursing, three distinct
+# carved-frieze bands) rather than a handful of individual shapes, which is what actually reads as
+# "stonework" / "brickwork" at a glance instead of a few dots on a line.
+_HOME_ILLUSTRATIONS = [
+    # Halebeedu: rhythmic colonnade of lathe-turned pillars over three stacked carved-frieze bands
+    # (Hoysala temples layer several distinct narrative bands -- beading, foliage, fretwork -- around
+    # the base), rising from the temple's signature stepped star-shaped plinth.
+    """<svg viewBox="0 0 1200 220" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="skyGoldenWide" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#f7e2b8"/><stop offset="55%" stop-color="#eab06a"/><stop offset="100%" stop-color="#c97a4f"/>
+          </linearGradient>
+          <pattern id="frieze1" width="20" height="12" patternUnits="userSpaceOnUse">
+            <rect width="20" height="12" fill="#3a3b36"/><circle cx="10" cy="6" r="2.6" fill="#171814"/>
+          </pattern>
+          <pattern id="frieze2" width="18" height="12" patternUnits="userSpaceOnUse">
+            <rect width="18" height="12" fill="#2a2b28"/>
+            <path d="M0 9 Q4.5 2 9 9 T18 9" stroke="#171814" stroke-width="1.8" fill="none"/>
+          </pattern>
+          <pattern id="frieze3" width="16" height="12" patternUnits="userSpaceOnUse">
+            <rect width="16" height="12" fill="#3a3b36"/>
+            <polygon points="8,1 14,6 8,11 2,6" fill="none" stroke="#171814" stroke-width="1.2"/>
+          </pattern>
+        </defs>
+        <rect width="1200" height="220" fill="url(#skyGoldenWide)"/>
+        <circle cx="1080" cy="64" r="38" fill="#fbe7c2" opacity="0.85"/>
+        <rect x="0" y="176" width="1200" height="44" fill="#20211d"/>
+        <rect x="0" y="122" width="1200" height="12" fill="url(#frieze1)"/>
+        <rect x="0" y="134" width="1200" height="12" fill="url(#frieze2)"/>
+        <rect x="0" y="146" width="1200" height="12" fill="url(#frieze3)"/>
+        <polygon points="0,176 30,162 60,176 90,162 120,176 150,162 180,176 210,162 240,176 270,162 300,176
+                          330,162 360,176 390,162 420,176 450,162 480,176 510,162 540,176 570,162 600,176
+                          630,162 660,176 690,162 720,176 750,162 780,176 810,162 840,176 870,162 900,176
+                          930,162 960,176 990,162 1020,176 1050,162 1080,176 1110,162 1140,176 1170,162 1200,176
+                          1200,220 0,220" fill="#171814"/>
+        <!-- pillars: inlined at each x (not <use href>) so this renders in any SVG viewer, not just
+             browsers that support SVG2 bare href on <use> -- xlink:href would work everywhere too,
+             but duplicating nine small shapes costs nothing and needs no namespace declaration. -->
+        <g fill="#171814">
+          <g transform="translate(60,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(160,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(260,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(360,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(460,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(860,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(950,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(1040,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+          <g transform="translate(1130,122)"><rect x="-3" y="0" width="6" height="58"/><ellipse cx="0" cy="14" rx="6.5" ry="4"/><ellipse cx="0" cy="27" rx="7.5" ry="4.6"/><ellipse cx="0" cy="40" rx="6" ry="3.6"/></g>
+        </g>
+        <g fill="#0f100d">
+          <polygon points="640,122 590,122 604,80 626,80"/>
+          <polygon points="598,80 632,80 622,52 608,52"/>
+          <polygon points="608,52 622,52 618,32"/>
+          <circle cx="615" cy="27" r="4"/>
+          <polygon points="800,122 750,122 764,80 786,80"/>
+          <polygon points="758,80 792,80 782,52 768,52"/>
+          <polygon points="768,52 782,52 778,32"/>
+          <circle cx="775" cy="27" r="4"/>
+          <polygon points="720,122 660,122 690,66"/>
+          <rect x="668" y="100" width="5" height="22"/><rect x="686" y="100" width="5" height="22"/><rect x="704" y="100" width="5" height="22"/>
+        </g>
+    </svg>""",
+    # Lothal: a full site-plan composition (citadel with buildings, warehouse grid, lower-town
+    # blocks, perimeter wall, river with green banks, dock with several boats, small figures and
+    # elephants for scale) -- not just a dock silhouette. Same flat-vector language as the rest of
+    # this set, not a painterly rendering.
+    """<svg viewBox="0 0 1400 320" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="skyDayLothal" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#bfe0ee"/><stop offset="55%" stop-color="#e7f0e0"/><stop offset="100%" stop-color="#e7c98a"/>
+          </linearGradient>
+          <pattern id="brickL" width="22" height="11" patternUnits="userSpaceOnUse">
+            <rect width="22" height="11" fill="#a15a34"/>
+            <rect x="0" y="0" width="10" height="4.5" fill="#7a3f24"/><rect x="11" y="0" width="10" height="4.5" fill="#7a3f24"/>
+            <rect x="5.5" y="5.5" width="10" height="4.5" fill="#7a3f24"/><rect x="16.5" y="5.5" width="5" height="4.5" fill="#7a3f24"/>
+            <rect x="-5.5" y="5.5" width="5" height="4.5" fill="#7a3f24"/>
+          </pattern>
+        </defs>
+        <rect width="1400" height="320" fill="url(#skyDayLothal)"/>
+        <circle cx="1250" cy="46" r="26" fill="#fff3d2" opacity="0.9"/>
+        <rect x="0" y="20" width="1400" height="50" fill="#bcd9a0" opacity="0.7"/>
+        <g stroke="#9fc084" stroke-width="1.5" opacity="0.6"><line x1="0" y1="35" x2="1400" y2="35"/><line x1="0" y1="52" x2="1400" y2="52"/></g>
+
+        <!-- river along the right, feeding the dock -->
+        <path d="M1400,60 C1300,90 1320,150 1260,200 C1220,230 1230,270 1200,300 L1400,320 Z" fill="#5ea3bd" opacity="0.85"/>
+        <rect x="1150" y="60" width="60" height="260" fill="#a9cf8e" opacity="0.5"/>
+
+        <!-- settlement ground -->
+        <rect x="0" y="70" width="1180" height="250" fill="#d9b483"/>
+        <!-- perimeter wall -->
+        <polygon points="40,90 1000,80 1150,120 1150,300 40,300" fill="none" stroke="#6b3820" stroke-width="4"/>
+
+        <!-- citadel: stepped brick platform with buildings on top -->
+        <polygon points="60,220 60,150 120,110 380,110 440,150 440,220" fill="url(#brickL)" stroke="#6b3820" stroke-width="2"/>
+        <polygon points="90,220 90,170 130,140 350,140 390,170 390,220" fill="url(#brickL)" stroke="#6b3820" stroke-width="1.5"/>
+        <g fill="#7a3f24" stroke="#5c2f1c" stroke-width="1.5">
+          <rect x="140" y="90" width="60" height="55"/><rect x="205" y="78" width="90" height="67"/><rect x="300" y="95" width="55" height="50"/>
+        </g>
+        <g fill="#5c2f1c">
+          <rect x="155" y="105" width="8" height="14"/><rect x="175" y="105" width="8" height="14"/>
+          <rect x="225" y="95" width="8" height="16"/><rect x="248" y="95" width="8" height="16"/><rect x="271" y="95" width="8" height="16"/>
+          <rect x="315" y="110" width="8" height="14"/>
+        </g>
+
+        <!-- warehouse: brick platform with its grid of storage blocks -->
+        <rect x="480" y="150" width="380" height="110" fill="url(#brickL)" stroke="#6b3820" stroke-width="2.5"/>
+        <g stroke="#6b3820" stroke-width="1.3">
+          <line x1="527" y1="150" x2="527" y2="260"/><line x1="575" y1="150" x2="575" y2="260"/>
+          <line x1="623" y1="150" x2="623" y2="260"/><line x1="670" y1="150" x2="670" y2="260"/>
+          <line x1="718" y1="150" x2="718" y2="260"/><line x1="765" y1="150" x2="765" y2="260"/><line x1="813" y1="150" x2="813" y2="260"/>
+          <line x1="480" y1="205" x2="860" y2="205"/>
+        </g>
+
+        <!-- lower town: grid of small building blocks -->
+        <g fill="#c99a63" stroke="#8a5a34" stroke-width="1">
+          <rect x="500" y="270" width="34" height="26"/><rect x="540" y="270" width="34" height="26"/><rect x="580" y="270" width="34" height="26"/>
+          <rect x="620" y="270" width="34" height="26"/><rect x="660" y="270" width="34" height="26"/><rect x="700" y="270" width="34" height="26"/>
+          <rect x="740" y="270" width="34" height="26"/><rect x="780" y="270" width="34" height="26"/><rect x="820" y="270" width="34" height="26"/>
+          <rect x="860" y="270" width="34" height="26"/><rect x="900" y="270" width="34" height="26"/><rect x="940" y="270" width="34" height="26"/>
+        </g>
+
+        <!-- dock basin fed by the river, with several boats -->
+        <polygon points="960,240 1150,232 1180,300 930,310" fill="url(#brickL)" stroke="#6b3820" stroke-width="3"/>
+        <polygon points="978,248 1130,241 1155,292 950,300" fill="#4c8fa6" opacity="0.8"/>
+        <g transform="translate(1010,262)">
+          <path d="M-20 7 Q0 15 20 7 L16 12 Q0 17 -16 12 Z" fill="#3a2416"/>
+          <rect x="-1.5" y="-20" width="2.5" height="26" fill="#3a2416"/>
+          <polygon points="1,-20 1,-4 19,-8" fill="#e8d3a6" opacity="0.92"/>
+        </g>
+        <g transform="translate(1075,272)">
+          <path d="M-15 5 Q0 11 15 5 L12 9 Q0 13 -12 9 Z" fill="#3a2416"/>
+          <rect x="-1.2" y="-14" width="2" height="18" fill="#3a2416"/>
+          <polygon points="0.8,-14 0.8,-2 13,-5" fill="#e8d3a6" opacity="0.92"/>
+        </g>
+        <g transform="translate(1260,220)">
+          <path d="M-16 6 Q0 12 16 6 L13 10 Q0 14 -13 10 Z" fill="#3a2416"/>
+          <rect x="-1.3" y="-16" width="2.2" height="20" fill="#3a2416"/>
+          <polygon points="0.9,-16 0.9,-3 15,-6" fill="#e8d3a6" opacity="0.92"/>
+        </g>
+
+        <!-- small figures and a pack elephant for narrative life -->
+        <g fill="#3a2416" opacity="0.85">
+          <g transform="translate(440,225)"><circle r="3"/><rect x="-1" y="3" width="2" height="10"/></g>
+          <g transform="translate(465,230)"><circle r="3"/><rect x="-1" y="3" width="2" height="10"/></g>
+          <g transform="translate(870,220)"><circle r="3"/><rect x="-1" y="3" width="2" height="10"/></g>
+          <g transform="translate(895,225)"><circle r="3"/><rect x="-1" y="3" width="2" height="10"/></g>
+        </g>
+        <g transform="translate(60,235)" fill="#6b5644">
+          <ellipse cx="0" cy="10" rx="16" ry="10"/><ellipse cx="15" cy="4" rx="8" ry="7"/>
+          <path d="M22 4 Q30 8 27 16" stroke="#6b5644" stroke-width="3" fill="none"/>
+          <rect x="-9" y="16" width="4" height="10"/><rect x="4" y="16" width="4" height="10"/>
+        </g>
+    </svg>""",
+]
+
+
+def _svg_data_uri(svg: str) -> str:
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
+def _travel_spirit_data_uri(index: int) -> str:
+    return _svg_data_uri(_TRAVEL_SPIRIT_SVGS[index % len(_TRAVEL_SPIRIT_SVGS)])
+
+
+def render_home_illustrations():
+    """Shown only before a trip is planned -- once planning_triggered is set, the actual plan
+    (and its own imagery) takes over and this shouldn't linger.
+
+    Deliberately full-width strips with no caption underneath, not boxed side-by-side postcards --
+    these are meant to read as an ambient decorative band behind the header, not as two labeled
+    tourist photos."""
+    if st.session_state.get('planning_triggered'):
+        return
+    for svg in _HOME_ILLUSTRATIONS:
+        st.markdown(
+            f'<img src="{_svg_data_uri(svg)}" style="width:100%; height:110px; object-fit:cover; '
+            'display:block; margin-bottom:2px;">',
+            unsafe_allow_html=True,
+        )
+
+
+def render_region_postcards():
+    """Shows real Wikipedia imagery for the origin and destination the user actually searched for,
+    in the sidebar -- Streamlit's existing side panel, reused for this instead of building a custom
+    layout. Genuinely dynamic per trip (unlike a fixed demo image set): it looks up whatever
+    origin/destination is in session state, so it changes with every search. A place with no
+    Wikipedia thumbnail falls back to a generic travel illustration instead of leaving a hole."""
+    origin = st.session_state.get('origin', '')
+    destination = st.session_state.get('destination', '')
+    places = [p for p in (origin, destination) if p]
+    if not places:
+        return
+
+    seen_titles = set()
+    with st.sidebar:
+        st.markdown("---")
+        st.caption("🖼️ Along your route")
+        for i, place in enumerate(places):
+            card = get_wikipedia_thumbnail(place)
+            if card and card['title'] not in seen_titles:
+                seen_titles.add(card['title'])
+                st.image(card['thumbnail_url'], width='stretch')
+                if card.get('page_url'):
+                    st.caption(f"[{card['title']}]({card['page_url']}) · Wikipedia")
+                else:
+                    st.caption(card['title'])
+            elif not card:
+                st.markdown(
+                    f'<img src="{_travel_spirit_data_uri(i)}" style="width:100%; border-radius:6px;">',
+                    unsafe_allow_html=True,
+                )
+                st.caption(place.split(",")[0].strip())
+
+
+# --- Structured response schema & rendering ---
+#
+# Gemini 3 models support combining function calling with response_schema/response_mime_type --
+# the model still calls tools freely mid-turn, but its final text turn (once it's done calling
+# tools) is forced into this JSON shape instead of whatever ad-hoc Markdown it feels like that run.
+# This was added because two runs on the same route/preferences produced completely different
+# layouts (a Markdown table one time, a numbered list the next) even though the underlying content
+# was equally good -- the *shape* wasn't reliable, so the app couldn't build any stable UI around
+# it. The app renders this JSON into Markdown itself (render_structured_response below), so layout
+# is now the app's job, not the model's whim, while the actual wording inside each string field
+# (verdicts, proactive notes, review takeaways) stays genuinely model-written, conversational text.
+#
+# response_type lets the same schema cover both a full trip plan and a plain conversational
+# follow-up ("why did you suggest that one?") without forcing every follow-up answer into the full
+# itinerary shape.
+#
+# As of this writing Google documents structured-output + tools together as a preview feature for
+# Gemini 3 models, not yet guaranteed -- parse_structured_response() below falls back to showing the
+# raw response text untouched if the model doesn't return valid JSON, so a preview-feature hiccup
+# degrades to the old plain-Markdown behavior instead of breaking the app.
+_OPTION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "name": {"type": "STRING"},
+        "place_id": {"type": "STRING", "nullable": True, "description": "The place_id from get_place_details_and_reviews, if this option came from a tool result."},
+        "rating_text": {"type": "STRING", "nullable": True, "description": "e.g. '4.0 (2,082 reviews)'"},
+        "price_level": {"type": "STRING", "nullable": True, "description": "e.g. 'Budget', 'Moderate', 'Expensive'"},
+        "hours_status": {"type": "STRING", "nullable": True, "description": "e.g. 'Open now, closes 11:00 PM'"},
+        "parking": {"type": "STRING", "nullable": True},
+        "elder_suitability": {"type": "STRING", "nullable": True, "description": "Only for food stops when the trip involves elderly travelers."},
+        "review_snippet": {"type": "STRING", "nullable": True},
+        "verdict": {"type": "STRING", "description": "The concierge's honest, specific take on this option -- pros/cons, not a single winner declaration."},
+    },
+    "required": ["name", "verdict"],
+}
+
+_STOP_CATEGORY_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "emoji": {"type": "STRING"},
+        "title": {"type": "STRING", "description": "e.g. 'Pure Veg Food Stops', 'Fuel / Petrol Options'"},
+        "options": {"type": "ARRAY", "items": _OPTION_SCHEMA},
+    },
+    "required": ["title", "options"],
+}
+
+_PLAN_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "intro_text": {"type": "STRING", "nullable": True, "description": "A short, conversational opening line."},
+        "trip_overview": {
+            "type": "OBJECT",
+            "properties": {
+                "distance_text": {"type": "STRING"},
+                "duration_text": {"type": "STRING"},
+                "toll_cost_text": {"type": "STRING", "nullable": True},
+                "departure_time_text": {"type": "STRING"},
+                "arrival_time_text": {"type": "STRING"},
+            },
+            "required": ["distance_text", "duration_text", "departure_time_text", "arrival_time_text"],
+        },
+        "itinerary_timeline": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "time": {"type": "STRING"},
+                    "label": {"type": "STRING"},
+                },
+                "required": ["time", "label"],
+            },
+        },
+        "proactive_notes": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "emoji": {"type": "STRING"},
+                    "title": {"type": "STRING"},
+                    "text": {"type": "STRING"},
+                },
+                "required": ["title", "text"],
+            },
+        },
+        "stop_categories": {"type": "ARRAY", "items": _STOP_CATEGORY_SCHEMA},
+    },
+    "required": ["trip_overview", "itinerary_timeline", "stop_categories"],
+}
+
+CONCIERGE_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "response_type": {"type": "STRING", "enum": ["plan", "answer"]},
+        "plan": {**_PLAN_SCHEMA, "nullable": True},
+        "answer_text": {"type": "STRING", "nullable": True, "description": "Used when response_type is 'answer' -- a plain conversational reply, not a full plan."},
+    },
+    "required": ["response_type"],
+}
+
+
+def parse_structured_response(response_text: str) -> dict | None:
+    """Parses the model's JSON text into a dict, tolerating a ```json fenced code block (some
+    models wrap JSON output in one even when told not to). Returns None if it's not valid JSON --
+    the caller falls back to showing the raw text as plain Markdown."""
+    text = response_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _format_option_markdown(option: dict, index: int | None = None) -> list[str]:
+    """Markdown lines for one option -- shared by render_structured_response (historical/fallback
+    Markdown rendering) and render_plan_cards (the live plan's actual card UI) so the two never
+    drift out of sync with each other."""
+    name = option.get("name", "Unknown")
+    header = f"**{index}. {name}**" if index is not None else f"**{name}**"
+    if option.get("rating_text"):
+        header += f" — {option['rating_text']}"
+    lines = [header]
+    details = []
+    if option.get("price_level"):
+        details.append(f"Price: {option['price_level']}")
+    if option.get("parking"):
+        details.append(f"Parking: {option['parking']}")
+    if option.get("hours_status"):
+        details.append(f"Hours: {option['hours_status']}")
+    if details:
+        lines.append("- " + " | ".join(details))
+    if option.get("elder_suitability"):
+        lines.append(f"- Elder-friendly: {option['elder_suitability']}")
+    if option.get("review_snippet"):
+        lines.append(f"- _\"{option['review_snippet']}\"_")
+    if option.get("verdict"):
+        lines.append(f"- **Take:** {option['verdict']}")
+    return lines
+
+
+def _format_option_plain(option: dict) -> str:
+    """Plain-text version of one option, for the per-option Copy/WhatsApp button -- deliberately not
+    just the Markdown lines joined together, since '**' shows up as literal asterisks once pasted
+    into WhatsApp or a text message instead of rendering as bold."""
+    name = option.get("name", "Unknown")
+    header = name + (f" — {option['rating_text']}" if option.get("rating_text") else "")
+    lines = [header]
+    details = []
+    if option.get("price_level"):
+        details.append(f"Price: {option['price_level']}")
+    if option.get("parking"):
+        details.append(f"Parking: {option['parking']}")
+    if option.get("hours_status"):
+        details.append(f"Hours: {option['hours_status']}")
+    if details:
+        lines.append(" | ".join(details))
+    if option.get("elder_suitability"):
+        lines.append(f"Elder-friendly: {option['elder_suitability']}")
+    if option.get("review_snippet"):
+        lines.append(f"\"{option['review_snippet']}\"")
+    if option.get("verdict"):
+        lines.append(f"Take: {option['verdict']}")
+    return "\n".join(lines)
+
+
+def _google_maps_place_url(option: dict) -> str:
+    """Google's documented Maps URLs API pattern for linking straight to one place: query_place_id
+    pins the exact business (not just a text search that might land on the wrong branch/duplicate
+    listing), with `query` as the required fallback search text if the place_id ever fails to
+    resolve. Falls back to a plain name search when there's no place_id -- e.g. a follow-up answer
+    that references a place from an earlier turn without re-running the search tools."""
+    name = option.get("name", "")
+    query = requests.utils.quote(name)
+    if option.get("place_id"):
+        return f"https://www.google.com/maps/search/?api=1&query={query}&query_place_id={option['place_id']}"
+    return f"https://www.google.com/maps/search/?api=1&query={query}"
+
+
+def render_structured_response(data: dict) -> str:
+    """Renders the structured JSON response into Markdown -- this is now where the app's visual
+    layout is decided, not left up to the model's formatting choice on any given run."""
+    if data.get("response_type") == "answer":
+        return data.get("answer_text") or "_(No answer text returned.)_"
+
+    plan = data.get("plan")
+    if not plan:
+        return "_(The model marked this as a plan but returned no plan data.)_"
+
+    lines = []
+    if plan.get("intro_text"):
+        lines.append(plan["intro_text"])
+        lines.append("")
+
+    overview = plan.get("trip_overview", {})
+    lines.append("### 🚗 Trip Overview")
+    lines.append(f"- **Distance:** {overview.get('distance_text', '—')}")
+    lines.append(f"- **Drive Duration:** {overview.get('duration_text', '—')}")
+    if overview.get("toll_cost_text"):
+        lines.append(f"- **Estimated Toll Cost:** {overview['toll_cost_text']}")
+    lines.append(f"- **Departure:** {overview.get('departure_time_text', '—')}")
+    lines.append(f"- **Estimated Arrival:** {overview.get('arrival_time_text', '—')}")
+    lines.append("")
+
+    timeline = plan.get("itinerary_timeline") or []
+    if timeline:
+        lines.append("### ⏱️ Itinerary Timeline")
+        lines.append("| Time | Stop |")
+        lines.append("|---|---|")
+        for item in timeline:
+            lines.append(f"| {item.get('time', '')} | {item.get('label', '')} |")
+        lines.append("")
+
+    notes = plan.get("proactive_notes") or []
+    if notes:
+        lines.append("### 💡 Proactive Notes")
+        for note in notes:
+            title = note.get("title", "")
+            emoji = note.get("emoji", "💡")
+            lines.append(f"**{emoji} {title}:** {note.get('text', '')}")
+            lines.append("")
+
+    for category in plan.get("stop_categories") or []:
+        lines.append(f"### {category.get('emoji', '')} {category.get('title', '')}".strip())
+        lines.append("")
+        for i, option in enumerate(category.get("options") or [], start=1):
+            lines.extend(_format_option_markdown(option, index=i))
+            lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def render_print_button():
+    """window.print() has to target the parent document, not the sandboxed iframe it runs in --
+    st.iframe's content is same-origin but still its own document, so a bare print() here would
+    print just this little button, not the actual page."""
+    st.iframe(
+        """
+        <button onclick="window.parent.print()" style="padding:6px 14px; border-radius:6px; border:1px solid #999;
+        background:#f0f2f6; color:#31333F; cursor:pointer; font-size:14px;">🖨️ Print</button>
+        """,
+        height=45,
+    )
+
+
+def render_plan_cards(plan: dict):
+    """Renders the current active plan as real Streamlit elements -- a card per option with its own
+    copy/share control, plus a whole-itinerary share/print section -- instead of one flat Markdown
+    blob. A plain Markdown string has no seams to hang per-option controls off of, which is why this
+    exists as a separate path from render_structured_response.
+
+    Only used for the LATEST plan message (see latest_plan_message_index in the render loop below);
+    older, superseded plans still in the chat history render as plain Markdown -- per-option
+    controls on a plan that's no longer the active one would just be confusing, and the whole-
+    itinerary share/print controls should only ever act on the current plan."""
+    if plan.get("intro_text"):
+        st.markdown(plan["intro_text"])
+
+    overview = plan.get("trip_overview", {})
+    overview_lines = [
+        "### 🚗 Trip Overview",
+        f"- **Distance:** {overview.get('distance_text', '—')}",
+        f"- **Drive Duration:** {overview.get('duration_text', '—')}",
+    ]
+    if overview.get("toll_cost_text"):
+        overview_lines.append(f"- **Estimated Toll Cost:** {overview['toll_cost_text']}")
+    overview_lines.append(f"- **Departure:** {overview.get('departure_time_text', '—')}")
+    overview_lines.append(f"- **Estimated Arrival:** {overview.get('arrival_time_text', '—')}")
+    st.markdown("\n".join(overview_lines))
+
+    timeline = plan.get("itinerary_timeline") or []
+    if timeline:
+        rows = "\n".join(f"| {item.get('time', '')} | {item.get('label', '')} |" for item in timeline)
+        st.markdown("### ⏱️ Itinerary Timeline\n| Time | Stop |\n|---|---|\n" + rows)
+
+    notes = plan.get("proactive_notes") or []
+    if notes:
+        st.markdown("### 💡 Proactive Notes")
+        for note in notes:
+            st.markdown(f"**{note.get('emoji', '💡')} {note.get('title', '')}:** {note.get('text', '')}")
+
+    for category in plan.get("stop_categories") or []:
+        st.markdown(f"### {category.get('emoji', '')} {category.get('title', '')}".strip())
+        for i, option in enumerate(category.get("options") or [], start=1):
+            with st.container(border=True):
+                st.markdown("\n\n".join(_format_option_markdown(option, index=i)))
+                render_copy_and_share(_format_option_plain(option))
+                st.markdown(
+                    f'<a href="{_google_maps_place_url(option)}" target="_blank" rel="noopener" '
+                    'style="font-size:13px; color:#4285F4; text-decoration:none;">🔗 View on Google Maps ↗</a>',
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("---")
+    st.markdown("##### 📤 Share or print the full itinerary")
+    share_col, print_col = st.columns([3, 1])
+    with share_col:
+        render_copy_and_share(render_structured_response({"response_type": "plan", "plan": plan}))
+    with print_col:
+        render_print_button()
+
+
+def response_to_markdown(response_text: str) -> tuple[str, dict]:
+    """Turns the model's raw response text into the Markdown actually shown in chat -- structured
+    JSON if it parsed and rendered cleanly, otherwise the raw text untouched (see the preview-feature
+    note above CONCIERGE_RESPONSE_SCHEMA for why this fallback exists).
+
+    Also returns a {structured_ok, response_type} dict for log_usage_event -- this is the only place
+    that knows whether structured output actually worked on this turn, so it's the natural place to
+    capture that as a performance signal instead of re-deriving it at the call site.
+
+    As a side effect, stashes data['plan'] into st.session_state.latest_plan whenever this turn is a
+    successfully-parsed 'plan' response -- that's what lets render_plan_cards, the stop-selector, and
+    the share/print controls act on the plan the user is actually looking at, not just its rendered
+    Markdown text. A conversational 'answer' turn leaves the previous plan in place deliberately: the
+    active plan hasn't changed just because the user asked a question about it."""
+    data = parse_structured_response(response_text)
+    if data is None:
+        logger.warning("structured response parse failed, showing raw text (len=%d)", len(response_text))
+        return response_text, {"structured_ok": False, "response_type": None}
+    try:
+        markdown = render_structured_response(data)
+        if data.get("response_type") == "plan" and data.get("plan"):
+            st.session_state.latest_plan = data["plan"]
+        return markdown, {"structured_ok": True, "response_type": data.get("response_type")}
+    except Exception:
+        logger.exception("structured response rendering failed, showing raw text")
+        return response_text, {"structured_ok": False, "response_type": data.get("response_type")}
+
+
 # --- Streamlit UI ---
 st.set_page_config(page_title="🧭 Journey Concierge", layout="wide")
 
 st.title("🧭 Journey Concierge")
+render_home_illustrations()
 
-# Sidebar for API keys
-with st.sidebar:
-    st.header("API Keys Configuration")
-    has_env_maps_key = bool(os.environ.get("GOOGLE_MAPS_API_KEY"))
-    has_env_gemini_key = bool(os.environ.get("GEMINI_API_KEY"))
-    google_maps_key_input = st.text_input(
-        "Google Maps API Key" + (" (server key configured)" if has_env_maps_key else ""),
-        type="password",
-        placeholder="Using server-configured key" if has_env_maps_key else None,
+# Printing the page as-is would include the sidebar, the trip-details inputs, the chat input box,
+# and every interactive control (copy/share/print buttons themselves) -- none of that belongs on a
+# printout of the itinerary. This only hides the chrome that's reliably identifiable by a stable
+# data-testid across reruns; the trip-details form itself isn't wrapped in anything targetable yet,
+# so it still prints for now (acceptable as context, not ideal).
+st.markdown(
+    """<style>
+    @media print {
+        [data-testid="stSidebar"], [data-testid="stChatInput"], [data-testid="stHeader"],
+        [data-testid="stStatusWidget"], .stButton, iframe { display: none !important; }
+    }
+    </style>""",
+    unsafe_allow_html=True,
+)
+
+# API keys always come from the server environment now -- this stopped being a shared workshop
+# deployment where each attendee needed to bring their own key, so the manual entry UI was just
+# clutter (and removing it frees up the sidebar for the route imagery below instead of key inputs).
+st.session_state.google_maps_api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+st.session_state.gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+if not st.session_state.google_maps_api_key or not st.session_state.gemini_api_key:
+    st.error(
+        "This deployment is missing its server-side API keys (GOOGLE_MAPS_API_KEY / GEMINI_API_KEY) "
+        "-- set them as environment variables (or in .env for local dev) to use the app."
     )
-    gemini_key_input = st.text_input(
-        "GEMINI API Key" + (" (server key configured)" if has_env_gemini_key else ""),
-        type="password",
-        placeholder="Using server-configured key" if has_env_gemini_key else None,
-    )
-    # Server-side env vars are used as a fallback without ever being sent to the
-    # browser as a widget value, so a public deployment doesn't leak its own keys.
-    st.session_state.google_maps_api_key = google_maps_key_input or os.environ.get("GOOGLE_MAPS_API_KEY", "")
-    st.session_state.gemini_api_key = gemini_key_input or os.environ.get("GEMINI_API_KEY", "")
-    st.markdown("---")
-    st.info("Get your Google Maps API Key from Google Cloud Console. Enable Routes API, Places API, Places API (New), and Places Autocomplete API.")
-    st.info("Get your Gemini API Key from Google AI Studio.")
 
 # Main Page Inputs
 st.header("Trip Details")
@@ -711,7 +1403,7 @@ except Exception as e:
 
 if st.button("Plan My Trip", width='stretch'):
     if not st.session_state.get("google_maps_api_key") or not st.session_state.get("gemini_api_key"):
-        st.warning("Please enter both Google Maps API Key and Gemini API Key in the sidebar.")
+        st.warning("This deployment's API keys aren't configured -- see the error above.")
     elif not departure_time_iso:
         st.warning("Please fix the departure time format.")
     else:
@@ -728,11 +1420,13 @@ if st.button("Plan My Trip", width='stretch'):
         st.session_state.discovered_places = {}
         st.session_state.route_stops_selected = []
         st.session_state.route_polyline = None
+        st.session_state.latest_plan = None
+        st.session_state.latest_plan_message_index = None
         st.session_state.need_new_plan = True
 
 if st.session_state.get('planning_triggered', False):
     if not st.session_state.get('gemini_api_key'):
-        st.error("Gemini API Key is missing. Please set it in the sidebar.")
+        st.error("GEMINI_API_KEY is not configured on the server.")
         st.stop()
 
     # Initialize the new Google GenAI Client
@@ -777,6 +1471,11 @@ if st.session_state.get('planning_triggered', False):
     #      generalizing the late-night-only fatigue note to any long drive, since tiredness doesn't
     #      wait for 10pm; and telling follow-up turns to build on what was already suggested instead
     #      of answering as if the conversation started fresh.
+    #   6. The final answer is now forced into CONCIERGE_RESPONSE_SCHEMA (see above) instead of free
+    #      Markdown -- two runs on identical input used to come back in visibly different layouts (a
+    #      table one time, a numbered list the next), so the app couldn't render anything consistent.
+    #      The prompt below now talks about populating JSON fields, not writing Markdown directly;
+    #      the actual layout is generated by render_structured_response() from that JSON.
     system_instruction = (
         "You are a Thoughtful Indian Journey Concierge. Your goal is to plan an optimal trip for the user -- "
         "whether it's a long highway drive between cities or a short trip across town -- and help with "
@@ -800,8 +1499,13 @@ if st.session_state.get('planning_triggered', False):
         "Apply every stated constraint (dietary needs, elderly/accessibility considerations, budget) across "
         "the whole trip, not just the stop category it was first mentioned for -- e.g. if the user said pure "
         "veg for the trip, a snack/grocery stop should be veg-friendly too, not just the restaurant stops. "
-        "Provide structured, scannable Markdown output. "
-        "Be extremely helpful and empathetic. Speak in a friendly, conversational tone, like a knowledgeable local guide. "
+        "Your final turn (once you're done calling tools) must be a JSON object matching the provided response "
+        "schema, not free-form Markdown -- set response_type to 'plan' for a full trip plan, or 'answer' for a "
+        "plain conversational reply to a follow-up that doesn't need the full itinerary structure (e.g. 'why did "
+        "you suggest that one?' or a simple factual question). The schema controls the layout; your job is the "
+        "words inside each field -- write them the same way you'd write a real answer: specific, opinionated, and "
+        "in a friendly, conversational tone, like a knowledgeable local guide, not generic filler. "
+        "Be extremely helpful and empathetic. "
         "Do not make up information. Only use the tools provided to gather information. "
         "If a tool call returns an error, do not retry it with guessed or reformatted inputs and do not invent "
         "place IDs or details — report the limitation to the user instead. "
@@ -817,9 +1521,14 @@ if st.session_state.get('planning_triggered', False):
         "but call search_places_along_route at most once per kind of stop needed. "
         "Call get_place_details_and_reviews exactly once, passing the place_ids of every candidate place "
         "you want details for together in one list, instead of calling it separately per place. "
-        "When outputting the final plan, include a summary itinerary timeline at the top with departure and stop "
-        "arrival times, and mention the estimated toll cost for the route if calculate_route_and_etas returned one. "
-        "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) for quick-scan ratings. Provide actual ratings and review snippets. "
+        "Every option that came from a real tool result has a real place_id from that tool response -- always "
+        "set the option's 'place_id' field to that exact value. It's used to build the 'get directions' link "
+        "and the 'view on Google Maps' link for that exact business, so leaving it out or inventing one breaks "
+        "those -- omit the field entirely only for an option that didn't come from a tool result at all. "
+        "Fill 'itinerary_timeline' with departure and every stop's arrival time, and set 'toll_cost_text' in "
+        "'trip_overview' if calculate_route_and_etas returned an estimate. "
+        "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) inside field text for quick-scan ratings where it helps. "
+        "Provide actual ratings and review snippets in the relevant option fields. "
         "The following Trip Stop Rubric applies specifically when evaluating FOOD stops (skip it for "
         "non-food stops like shops, fuel, or pharmacies, and instead just note hours, ratings, and anything "
         "relevant from reviews): explicitly state if it's 'Pure Veg', 'Veg & Non-Veg', or 'Fast Food/Chains'; "
@@ -829,23 +1538,25 @@ if st.session_state.get('planning_triggered', False):
         "get_place_details_and_reviews, and its price level (using the 'price_level' field -- e.g. Budget/ "
         "Moderate/Expensive -- when available) since cost is part of a real comparison between options. "
         "Think proactively about the journey's timing using the duration and ETAs from calculate_route_and_etas, "
-        "and volunteer relevant suggestions even when the user didn't explicitly ask for them -- clearly flagged "
-        "as proactive (e.g. under a '💡 Since your trip...' note) so they don't crowd out what was actually asked: "
+        "and volunteer relevant suggestions even when the user didn't explicitly ask for them -- put these in "
+        "'proactive_notes' entries (separate from the options/categories the user actually asked for) so they "
+        "don't crowd out what was actually asked: "
         "- Compare the departure time and ETAs against typical Indian meal windows (breakfast ~7-10am, lunch "
         "~12:30-3pm, dinner ~7:30-10:30pm). If the journey overlaps one, proactively suggest a food stop timed to "
         "that point even if the user only asked for something else like fuel or snacks -- people traveling around "
         "mealtimes usually want to eat too. "
         "- Call search_places_along_route with a query like 'clean public restroom' or 'rest area' -- and include "
-        "a distinct '🚻 Restroom Stops' section with real results from it -- only when the total drive duration "
-        "exceeds 2 hours, or when the user specifically asked for restrooms regardless of trip length. Don't run "
+        "a distinct stop_categories entry (title like '🚻 Restroom Stops') with real results from it -- only when "
+        "the total drive duration exceeds 2 hours, or when the user specifically asked for restrooms regardless "
+        "of trip length. Don't run "
         "this search for short trips unless it was actually requested. When it does apply, don't consider a food "
         "stop's restroom sufficient on its own, since it may not land at a convenient point in the drive; for 4+ "
         "hour trips, look for more than one restroom option spaced through the journey rather than one near the start. "
         "- When the trip needs more than one kind of stop (e.g. food and fuel), check whether one location can "
         "reasonably cover more than one need (e.g. a fuel stop with an attached food court, or a restaurant near "
         "a pharmacy) before treating them as fully separate stops -- a real planner minimizes the number of "
-        "physical stops where it doesn't compromise quality, and calls it out when it applies (e.g. '💡 X covers "
-        "both your fuel and snack stop in one place'). "
+        "physical stops where it doesn't compromise quality, and calls it out in a proactive_notes entry when it "
+        "applies (e.g. 'X covers both your fuel and snack stop in one place'). "
         "- Independent of time of day, for any drive over about 3 hours, proactively suggest at least one short "
         "break purely for driver alertness (stretch, tea/coffee) roughly every 2-3 hours, even if the user didn't "
         "ask for a restroom or food stop -- fatigue risk doesn't wait for night to set in. "
@@ -856,10 +1567,13 @@ if st.session_state.get('planning_triggered', False):
         "blog mentions, its own website) before recommending it, and say in the plan that you double-checked it "
         "this way since Google reviews were sparse. "
         "When answering a follow-up that asks for a change or a different option (e.g. 'suggest a different "
-        "restaurant', 'what about something cheaper'), build on what you already suggested instead of answering "
-        "as if the conversation just started -- briefly say how the new answer differs from or improves on the "
-        "earlier one, and reuse place details you already have from this conversation if they satisfy the new "
-        "ask rather than re-searching from scratch."
+        "restaurant', 'what about something cheaper'), use response_type 'plan' again with the updated "
+        "stop_categories/options, and build on what you already suggested instead of answering as if the "
+        "conversation just started -- mention how the new answer differs from or improves on the earlier one "
+        "(e.g. in intro_text or a verdict), and reuse place details you already have from this conversation if "
+        "they satisfy the new ask rather than re-searching from scratch. For a purely conversational follow-up "
+        "that isn't asking for a plan change (e.g. 'why did you suggest that one?'), use response_type 'answer' "
+        "instead."
     )
 
     # Set up configuration with tools and system instruction
@@ -869,6 +1583,14 @@ if st.session_state.get('planning_triggered', False):
         # Required to mix our custom function-calling tools with the built-in Google Search tool --
         # omitting this gives a 400 telling you to set exactly this flag.
         tool_config=types.ToolConfig(include_server_side_tool_invocations=True),
+        # Gemini 3 models support combining tools with structured output: the model still calls
+        # tools freely, but its final (non-tool-call) turn is forced into CONCIERGE_RESPONSE_SCHEMA
+        # instead of whatever ad-hoc Markdown it feels like that run -- see the schema/rendering
+        # comment above render_structured_response() for why. Documented as a preview capability as
+        # of this writing; parse_structured_response() falls back to raw text if it's ever not
+        # honored, so this degrades gracefully rather than breaking the app.
+        response_mime_type="application/json",
+        response_schema=CONCIERGE_RESPONSE_SCHEMA,
         # The SDK default is 10. A typical plan now needs ~3-6 calls (route + 1-2 category searches
         # + one batched details call), well under that -- this is headroom for multi-need requests
         # (e.g. food + fuel + restrooms all in one trip) plus the occasional google_search
@@ -911,21 +1633,32 @@ if st.session_state.get('planning_triggered', False):
         response = chat.send_message(prompt)
         duration_s = time.monotonic() - start
         status.update(label=f"✅ Plan ready in {duration_s:.1f}s", state="complete")
+        content, response_meta = response_to_markdown(response.text)
         log_usage_event("plan", st.session_state.origin, st.session_state.destination,
-                         st.session_state.preferences, duration_s, st.session_state._tool_trace)
+                         st.session_state.preferences, duration_s, st.session_state._tool_trace, response_meta)
         st.session_state._progress_status = None
-        st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
+        st.session_state.chat_messages.append({"role": "assistant", "content": content})
+        if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
+            st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
 
     st.subheader("Your Personalized Journey Plan")
-    for message in st.session_state.chat_messages:
+    for i, message in enumerate(st.session_state.chat_messages):
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if message["role"] == "assistant":
-                render_copy_and_share(message["content"])
+            is_latest_plan = (
+                i == st.session_state.get("latest_plan_message_index")
+                and st.session_state.get("latest_plan")
+            )
+            if is_latest_plan:
+                render_plan_cards(st.session_state.latest_plan)
+            else:
+                st.markdown(message["content"])
+                if message["role"] == "assistant":
+                    render_copy_and_share(message["content"])
 
     render_route_map()
     render_place_photos()
     render_navigate_links()
+    render_region_postcards()
 
     followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
     if followup:
@@ -937,8 +1670,11 @@ if st.session_state.get('planning_triggered', False):
         response = chat.send_message(followup)
         duration_s = time.monotonic() - start
         status.update(label=f"✅ Answered in {duration_s:.1f}s", state="complete")
+        content, response_meta = response_to_markdown(response.text)
         log_usage_event("followup", st.session_state.origin, st.session_state.destination,
-                         followup, duration_s, st.session_state._tool_trace)
+                         followup, duration_s, st.session_state._tool_trace, response_meta)
         st.session_state._progress_status = None
-        st.session_state.chat_messages.append({"role": "assistant", "content": response.text})
+        st.session_state.chat_messages.append({"role": "assistant", "content": content})
+        if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
+            st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
         st.rerun()
