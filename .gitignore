@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 *.log
 usage_log.csv
+feedback_log.csv
+gen-lang-client-*.json
