@@ -1,0 +1,21 @@
+[theme]
+# Karla (body) + Saira Condensed (headings) -- carried over from the highway-dashboard concept
+# explored in this session's design work (see DESIGN_CONCEPTS.md). Karla is a warm, readable
+# humanist sans that fits the "knowledgeable local friend" voice the system prompt aims for;
+# Saira Condensed is bold/geometric, closer to highway signage and dashboard numerals, used only
+# for headings so it doesn't fight with body-text readability.
+#
+# Two syntax gotchas, both confirmed against streamlit's own bundled theming reference
+# (.venv/.../streamlit/.agents/skills/developing-with-streamlit/references/theme.md):
+#   1. No commas inside the Google Fonts URL -- Streamlit treats a comma anywhere in this value as
+#      separating multiple fallback fonts, so Karla's usual `ital,wght@0,400;...` combined-axis
+#      syntax (which needs a comma to join the ital and wght axes) silently corrupts the URL. Fixed
+#      by dropping the italic axis and requesting weights with `:wght@400;500;700` only (semicolons,
+#      no comma) -- costs italic support, not needed here.
+#   2. Don't append a manual ", sans-serif" fallback -- Streamlit already appends its own fallback
+#      automatically (confirmed live: computed style came back as
+#      `"Karla", "Source Sans", sans-serif` with zero fonts requested past Karla itself).
+#   3. Multi-word family names need single quotes, per the docs' own example
+#      ("'IBM Plex Sans':https://...").
+font = "Karla:https://fonts.googleapis.com/css2?family=Karla:wght@400;500;700&display=swap"
+headingFont = "'Saira Condensed':https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700&display=swap"

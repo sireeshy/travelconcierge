@@ -420,6 +420,11 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     function-calling loop that drives this app has a capped number of round trips
     (see maximum_remote_calls below) -- evaluating 5 candidate places used to cost 5 of that budget
     on its own, which was the dominant reason plans ran out of calls before producing a final answer.
+
+    The result for each place includes 'most_recent_review' (how long ago the newest review was
+    posted, to gauge whether the rating still reflects the place today) and 'critical_review' (the
+    most unfavorable review Google returned, only present if it's actually <=3 stars -- null if
+    every review Google returned was positive) alongside the usual top reviews.
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
@@ -442,14 +447,29 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
             continue
         details_data = response.json()
 
-        reviews = []
-        for r_data in details_data.get('reviews', [])[:3]:
+        # Process every review Google actually returns (New Places API caps this at 5) before
+        # slicing anything down -- picking the "top 3" first, as this used to, meant recency and
+        # any negative review nearly always got cut before they were even looked at, since Google's
+        # default ordering favors highly-rated/relevant reviews.
+        all_reviews = []
+        for r_data in details_data.get('reviews', []):
             review_text = r_data.get('text', {}).get('text', '')
-            reviews.append({
+            all_reviews.append({
                 "author_name": r_data.get('authorAttribution', {}).get('displayName', 'Anonymous'),
                 "rating": r_data.get('rating', 0),
-                "text": review_text[:280]
+                "text": review_text[:280],
+                "relative_time": r_data.get('relativePublishTimeDescription'),
+                "publish_time": r_data.get('publishTime', ''),  # RFC3339 UTC -- sorts correctly as a plain string
             })
+
+        reviews = all_reviews[:3]
+        # publishTime sorts correctly as a string since it's RFC3339 UTC (e.g. "2026-08-02T...Z").
+        most_recent_review = max(all_reviews, key=lambda r: r['publish_time'], default=None)
+        # "Critical" means an actually unfavorable review (<=3 stars), not just the least-glowing of
+        # five great ones -- if nothing in Google's returned set clears that bar, say so rather than
+        # mislabel a 4-star review as the downside.
+        worst = min(all_reviews, key=lambda r: r['rating'], default=None)
+        critical_review = worst if worst and worst['rating'] <= 3 else None
 
         parking_options = details_data.get('parkingOptions', {})
         available_parking = [
@@ -468,6 +488,19 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
             "place_id": place_id,
             "opening_hours": details_data.get('regularOpeningHours'),
             "reviews": reviews,
+            "most_recent_review": (
+                {"relative_time": most_recent_review['relative_time'], "rating": most_recent_review['rating']}
+                if most_recent_review else None
+            ),
+            "critical_review": (
+                {
+                    "author_name": critical_review['author_name'],
+                    "rating": critical_review['rating'],
+                    "text": critical_review['text'],
+                    "relative_time": critical_review['relative_time'],
+                }
+                if critical_review else None
+            ),
             "current_opening_status": (
                 "Open now" if details_data.get('currentOpeningHours', {}).get('openNow')
                 else "Closed now" if 'currentOpeningHours' in details_data
@@ -961,9 +994,11 @@ _OPTION_SCHEMA = {
         "parking": {"type": "STRING", "nullable": True},
         "elder_suitability": {"type": "STRING", "nullable": True, "description": "Only for food stops when the trip involves elderly travelers."},
         "review_snippet": {"type": "STRING", "nullable": True},
+        "review_recency": {"type": "STRING", "nullable": True, "description": "REQUIRED whenever this option came from get_place_details_and_reviews: copy most_recent_review.relative_time verbatim (e.g. '3 weeks ago'). This is what lets the user judge whether the star rating still reflects the place today, not just what it was years ago. Only null for an option with no tool result to read it from."},
+        "critical_review_snippet": {"type": "STRING", "nullable": True, "description": "REQUIRED field (value may be null, but the field itself must always be set, never omitted): copy critical_review.text verbatim if get_place_details_and_reviews returned a critical_review for this place, so the user sees a real downside alongside the positive quote -- set explicitly to null only when critical_review was actually null (every review Google returned was positive), never left out just because a bad review would make the option look worse."},
         "verdict": {"type": "STRING", "description": "The concierge's honest, specific take on this option -- pros/cons, not a single winner declaration."},
     },
-    "required": ["name", "verdict"],
+    "required": ["name", "verdict", "review_recency", "critical_review_snippet"],
 }
 
 _STOP_CATEGORY_SCHEMA = {
@@ -1064,7 +1099,10 @@ def _format_option_markdown(option: dict, index: int | None = None) -> list[str]
     if option.get("elder_suitability"):
         lines.append(f"- Elder-friendly: {option['elder_suitability']}")
     if option.get("review_snippet"):
-        lines.append(f"- _\"{option['review_snippet']}\"_")
+        recency = f" (most recent review: {option['review_recency']})" if option.get("review_recency") else ""
+        lines.append(f"- _\"{option['review_snippet']}\"_{recency}")
+    if option.get("critical_review_snippet"):
+        lines.append(f"- ⚠️ _\"{option['critical_review_snippet']}\"_")
     if option.get("verdict"):
         lines.append(f"- **Take:** {option['verdict']}")
     return lines
@@ -1089,7 +1127,10 @@ def _format_option_plain(option: dict) -> str:
     if option.get("elder_suitability"):
         lines.append(f"Elder-friendly: {option['elder_suitability']}")
     if option.get("review_snippet"):
-        lines.append(f"\"{option['review_snippet']}\"")
+        recency = f" (most recent review: {option['review_recency']})" if option.get("review_recency") else ""
+        lines.append(f"\"{option['review_snippet']}\"{recency}")
+    if option.get("critical_review_snippet"):
+        lines.append(f"Unfavorable review: \"{option['critical_review_snippet']}\"")
     if option.get("verdict"):
         lines.append(f"Take: {option['verdict']}")
     return "\n".join(lines)
@@ -1264,6 +1305,22 @@ st.set_page_config(page_title="🧭 Journey Concierge", layout="wide")
 
 st.title("🧭 Journey Concierge")
 render_home_illustrations()
+
+# .streamlit/config.toml's theme.font/headingFont correctly set the CSS font-family (confirmed via
+# computed style -- "Karla" and "Saira Condensed" both show up as the primary font), but on this
+# installed Streamlit build (1.62.0) it never actually fetches the font file: no <link>, no
+# @font-face rule, no network request, despite the docs bundled with this exact package describing
+# "name:url" as loading the font automatically. Verified the URL itself is fine (fetched clean
+# @font-face CSS directly). So the font-family is declared but nothing on the page can render it,
+# and every element silently falls back to Streamlit's default font. This adds only the missing
+# stylesheet link -- config.toml still owns which font-family is requested.
+st.markdown(
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link href="https://fonts.googleapis.com/css2?family=Karla:ital,wght@0,400;0,500;0,700;1,400'
+    '&family=Saira+Condensed:wght@500;600;700&display=swap" rel="stylesheet">',
+    unsafe_allow_html=True,
+)
 
 # Printing the page as-is would include the sidebar, the trip-details inputs, the chat input box,
 # and every interactive control (copy/share/print buttons themselves) -- none of that belongs on a
@@ -1528,7 +1585,14 @@ if st.session_state.get('planning_triggered', False):
         "Fill 'itinerary_timeline' with departure and every stop's arrival time, and set 'toll_cost_text' in "
         "'trip_overview' if calculate_route_and_etas returned an estimate. "
         "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) inside field text for quick-scan ratings where it helps. "
-        "Provide actual ratings and review snippets in the relevant option fields. "
+        "Provide actual ratings and review snippets in the relevant option fields. For every option, also set "
+        "'review_recency' from get_place_details_and_reviews's most_recent_review.relative_time -- a 4.5-star "
+        "rating built on reviews from years ago is a different, weaker signal than the same rating with reviews "
+        "from last month, and the user can't tell the difference unless you say so. Also set "
+        "'critical_review_snippet' from critical_review.text whenever get_place_details_and_reviews returned one "
+        "for that place -- a genuinely balanced take shows the downside too, not just the best quote available; "
+        "leave it null only when critical_review was actually null (nothing <=3 stars in what Google returned), "
+        "never omit it just because it makes the option look worse. "
         "The following Trip Stop Rubric applies specifically when evaluating FOOD stops (skip it for "
         "non-food stops like shops, fuel, or pharmacies, and instead just note hours, ratings, and anything "
         "relevant from reviews): explicitly state if it's 'Pure Veg', 'Veg & Non-Veg', or 'Fast Food/Chains'; "

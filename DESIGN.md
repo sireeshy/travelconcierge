@@ -5,15 +5,15 @@ is grounded in the live code as of this writing — see the line-anchored notes 
 
 ## The honest summary
 
-There is **no Streamlit theme file** (`.streamlit/config.toml` doesn't exist) — the app runs on
-Streamlit's stock default theme for every native widget: headers, buttons, inputs, the sidebar,
-`st.status`, `st.radio`, `st.container`. Default light/dark switching follows the visitor's system
-setting; nothing overrides Streamlit's own palette or font stack.
+`.streamlit/config.toml` exists and sets a real typeface (Karla body / Saira Condensed headings —
+see Typography below), but that's the *only* theming applied. Colors, radii, sidebar styling, chart
+colors, all of it are still Streamlit's stock default theme. Default light/dark switching follows
+the visitor's system setting.
 
-On top of that default chrome, a small number of specific elements carry **hand-set inline colors**
-(mostly matching third-party brand colors, since they link out to those products), plus **two SVG
-illustrations** with their own bespoke, self-contained palettes. Those are the only two places any
-deliberate "branding" exists right now — everything else is default Streamlit.
+On top of that mostly-default chrome, a small number of specific elements carry **hand-set inline
+colors** (mostly matching third-party brand colors, since they link out to those products), plus
+**two SVG illustrations** with their own bespoke, self-contained palettes. Those are the only other
+places any deliberate "branding" exists right now.
 
 ## Inline-styled UI elements
 
@@ -34,15 +34,28 @@ constant.
 
 ## Typography
 
-**No custom font is loaded anywhere in `app.py`.** Every native Streamlit element (headings, body
-text, buttons, inputs) renders in Streamlit's default font stack (`"Source Sans Pro", sans-serif`
-in the current Streamlit theme). The inline-HTML buttons above don't set `font-family` either, so
-they inherit the same default.
+**Karla** (body) + **Saira Condensed** (headings), both Google Fonts, set via
+`.streamlit/config.toml`'s `theme.font` / `theme.headingFont` — the pairing carried over from the
+highway-dashboard concept explored in this session's design work (see DESIGN_CONCEPTS.md). Every
+native Streamlit element (headings, body text, buttons, inputs) picks these up automatically; the
+inline-HTML buttons in the table above don't set their own `font-family`, so they inherit the same
+two fonts through normal CSS inheritance.
 
-The Google Fonts pairings explored this session (Saira Condensed / Karla / JetBrains Mono for the
-highway-dashboard concept; Space Mono / Karla for the "Two Rough Directions" sketches) live **only**
-in throwaway design-exploration Artifacts, never in `app.py`. If a real typographic identity gets
-adopted, it hasn't shipped yet.
+**A real gap worth knowing about:** on the installed Streamlit build (1.62.0), `config.toml`'s
+`theme.font`/`headingFont` correctly set the CSS `font-family` declaration, but the build never
+actually fetches the font file — no `<link>`, no `@font-face`, no network request, confirmed via
+`document.fonts` and the network panel, despite this exact package's own bundled theming docs
+describing "name:url" as loading the font automatically. Fixed with one extra `st.markdown(
+unsafe_allow_html=True)` call injecting just the missing Google Fonts `<link>` (`app.py`, right
+after `render_home_illustrations()`) — `config.toml` still owns *which* font is requested, the
+injected link is only there to make the browser actually able to render it. If a Streamlit upgrade
+ever fixes this natively, that one `st.markdown` call becomes redundant and can be deleted.
+
+Font sizes/weights are still Streamlit's defaults — no `baseFontSize`, `headingFontSizes`, or
+`headingFontWeights` set, so there's a typeface but not yet a defined type scale.
+
+The Space Mono / JetBrains Mono choices from the *other* explored concepts (route-native "Strip",
+"Dossier") are unrelated to this pairing and remain unshipped — see DESIGN_CONCEPTS.md.
 
 ## Iconography — the emoji vocabulary
 
@@ -107,9 +120,10 @@ the other two.
 
 ## What this means for future work
 
-There's no single accent color, no defined neutral scale, no shared type ramp — three different
-illustration palettes and five different inline-styled UI elements, each chosen independently. If a
-real design system gets adopted (the earlier "highway dashboard" and route-native/dossier concepts
-explored in Artifacts this session are candidates), it should replace all of the above with a single
-token set — pulling every hard-coded hex in this file into shared constants — rather than adding a
-fourth palette alongside the existing three.
+There's a typeface now, but still no single accent color, no defined neutral scale, no type *scale*
+(sizes/weights), and no reconciliation between the three different illustration palettes and five
+different inline-styled UI elements, each chosen independently. If a real design system gets
+adopted (see DESIGN_CONCEPTS.md for the route-native/dossier concepts explored as candidates), it
+should replace all of the above with a single token set — pulling every hard-coded hex in this file
+into shared constants, and defining `baseFontSize`/`headingFontSizes` alongside the fonts already
+set — rather than adding a fourth palette alongside the existing three.
