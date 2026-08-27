@@ -1304,6 +1304,10 @@ def response_to_markdown(response_text: str) -> tuple[str, dict]:
 st.set_page_config(page_title="🧭 Journey Concierge", layout="wide")
 
 st.title("🧭 Journey Concierge")
+st.caption(
+    "Live, verified stops for food, fuel, and rest — planned along your actual route and verified "
+    "live on Google Maps."
+)
 render_home_illustrations()
 
 # .streamlit/config.toml's theme.font/headingFont correctly set the CSS font-family (confirmed via
